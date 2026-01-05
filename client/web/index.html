@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>QR码文件传输 - 轮播播放</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+
+            body {
+                font-family: "Consolas", "Monaco", monospace;
+                background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+                min-height: 100vh;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+            }
+
+            .container {
+                background: white;
+                border-radius: 20px;
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+                padding: 40px;
+                max-width: 600px;
+                width: 100%;
+                text-align: center;
+            }
+
+            .header {
+                border: 3px solid #1e3c72;
+                border-radius: 10px;
+                padding: 20px;
+                margin-bottom: 30px;
+                background: #f8f9fa;
+            }
+
+            .header h1 {
+                color: #1e3c72;
+                font-size: 24px;
+                margin-bottom: 10px;
+            }
+
+            .stats {
+                display: flex;
+                justify-content: space-around;
+                margin-top: 15px;
+                color: #555;
+                font-size: 14px;
+            }
+
+            .stat-item {
+                display: flex;
+                flex-direction: column;
+                gap: 5px;
+            }
+
+            .stat-value {
+                font-size: 24px;
+                font-weight: bold;
+                color: #1e3c72;
+            }
+
+            .qr-container {
+                position: relative;
+                width: 100%;
+                max-width: 400px;
+                margin: 0 auto 30px;
+            }
+
+            .qr-image {
+                width: 100%;
+                height: auto;
+                border: 4px solid #1e3c72;
+                border-radius: 10px;
+                background: white;
+                transition: transform 0.3s ease;
+            }
+
+            .qr-image:hover {
+                transform: scale(1.02);
+            }
+
+            .data-preview {
+                background: #f8f9fa;
+                border: 2px solid #dee2e6;
+                border-radius: 8px;
+                padding: 15px;
+                margin-top: 20px;
+                font-size: 12px;
+                color: #666;
+                word-break: break-all;
+                max-height: 100px;
+                overflow-y: auto;
+            }
+
+            .controls {
+                display: flex;
+                gap: 10px;
+                margin-top: 20px;
+                justify-content: center;
+            }
+
+            button {
+                padding: 10px 20px;
+                font-size: 16px;
+                border: none;
+                border-radius: 8px;
+                cursor: pointer;
+                transition: all 0.3s ease;
+                font-family: inherit;
+            }
+
+            .btn-primary {
+                background: #1e3c72;
+                color: white;
+            }
+
+            .btn-primary:hover {
+                background: #2a5298;
+                transform: translateY(-2px);
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+            }
+
+            .btn-secondary {
+                background: #6c757d;
+                color: white;
+            }
+
+            .btn-secondary:hover {
+                background: #5a6268;
+            }
+
+            .progress {
+                width: 100%;
+                height: 6px;
+                background: #e9ecef;
+                border-radius: 3px;
+                margin-top: 20px;
+                overflow: hidden;
+            }
+
+            .progress-bar {
+                height: 100%;
+                background: linear-gradient(90deg, #1e3c72, #2a5298);
+                transition: width 0.3s ease;
+            }
+
+            @keyframes pulse {
+                0%,
+                100% {
+                    opacity: 1;
+                }
+                50% {
+                    opacity: 0.7;
+                }
+            }
+
+            .status-playing {
+                color: #28a745;
+                animation: pulse 1s infinite;
+            }
+
+            .error {
+                background: #f8d7da;
+                border: 2px solid #f5c6cb;
+                color: #721c24;
+                padding: 20px;
+                border-radius: 10px;
+                margin: 20px 0;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>📱 QR码文件传输</h1>
+                <div class="stats">
+                    <div class="stat-item">
+                        <span class="stat-value" id="current">-</span>
+                        <span>当前</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-value" id="total">-</span>
+                        <span>总数</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-value" id="status">⏳</span>
+                        <span id="status-text">加载中</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="qr-container">
+                <img
+                    id="qr-image"
+                    class="qr-image"
+                    src=""
+                    alt="QR Code"
+                    style="display: none"
+                />
+            </div>
+
+            <div class="data-preview" id="data-preview">加载中...</div>
+
+            <div class="progress">
+                <div
+                    class="progress-bar"
+                    id="progress-bar"
+                    style="width: 0%"
+                ></div>
+            </div>
+
+            <div class="controls">
+                <button
+                    class="btn-primary"
+                    id="start-play"
+                    onclick="startPlayClick()"
+                    disabled
+                >
+                    开始播放
+                </button>
+                <button
+                    class="btn-primary"
+                    id="play-pause"
+                    onclick="togglePlay()"
+                    style="display: none"
+                >
+                    暂停
+                </button>
+                <button class="btn-secondary" onclick="restart()" disabled>
+                    重新开始
+                </button>
+            </div>
+        </div>
+
+        <script>
+            const SLIDE_INTERVAL_MS = 300;
+            let totalQr = 0;
+            let currentIndex = 0;
+            let isPlaying = false;
+            let interval = null;
+            let hasStarted = false;
+
+            const qrImage = document.getElementById("qr-image");
+            const currentSpan = document.getElementById("current");
+            const totalSpan = document.getElementById("total");
+            const statusSpan = document.getElementById("status");
+            const statusText = document.getElementById("status-text");
+            const progressBar = document.getElementById("progress-bar");
+            const startPlayBtn = document.getElementById("start-play");
+            const playPauseBtn = document.getElementById("play-pause");
+            const restartBtn = document.querySelector(".btn-secondary");
+            const dataPreview = document.getElementById("data-preview");
+
+            // 从 API 获取二维码信息
+            async function loadQrInfo() {
+                try {
+                    const response = await fetch("/api/info");
+                    const data = await response.json();
+
+                    if (data.error) {
+                        showError(data.error);
+                        return;
+                    }
+
+                    totalQr = data.total;
+                    totalSpan.textContent = totalQr;
+
+                    if (totalQr === 0) {
+                        showError("未找到二维码文件，请先使用命令行生成二维码");
+                        return;
+                    }
+
+                    // 准备就绪，等待用户点击开始播放
+                    currentIndex = 0;
+                    updateDisplay();
+                    statusSpan.textContent = "▶️";
+                    statusText.textContent = "准备就绪";
+                    startPlayBtn.disabled = false;
+                } catch (error) {
+                    showError("无法连接到服务器");
+                    console.error(error);
+                }
+            }
+
+            // 点击开始播放按钮
+            function startPlayClick() {
+                hasStarted = true;
+                startPlayBtn.style.display = "none";
+                playPauseBtn.style.display = "inline-block";
+                restartBtn.disabled = false;
+                startPlay();
+            }
+
+            function updateDisplay() {
+                const filename = `qr_output/qr_${String(currentIndex + 1).padStart(3, "0")}.svg`;
+                qrImage.src = filename;
+                qrImage.style.display = "block";
+                currentSpan.textContent = currentIndex + 1;
+                progressBar.style.width = `${((currentIndex + 1) / totalQr) * 100}%`;
+                dataPreview.textContent = `文件: qr_${String(currentIndex + 1).padStart(3, "0")}.svg`;
+            }
+
+            function nextQr() {
+                // 播放到最后一个QR码时自动暂停
+                if (currentIndex + 1 >= totalQr) {
+                    stopPlay();
+                    statusSpan.textContent = "✅";
+                    statusText.textContent = "播放完毕";
+                    return;
+                }
+                currentIndex = currentIndex + 1;
+                updateDisplay();
+            }
+
+            function startPlay() {
+                interval = setInterval(nextQr, SLIDE_INTERVAL_MS);
+                isPlaying = true;
+                statusSpan.textContent = "▶";
+                statusText.textContent = "播放中";
+                statusText.className = "status-playing";
+                playPauseBtn.textContent = "暂停";
+            }
+
+            function stopPlay() {
+                clearInterval(interval);
+                isPlaying = false;
+                statusSpan.textContent = "⏸";
+                statusText.textContent = "已暂停";
+                statusText.className = "";
+                playPauseBtn.textContent = "播放";
+            }
+
+            function togglePlay() {
+                if (isPlaying) {
+                    stopPlay();
+                } else {
+                    startPlay();
+                }
+            }
+
+            function restart() {
+                currentIndex = 0;
+                updateDisplay();
+                if (!isPlaying && hasStarted) {
+                    startPlay();
+                }
+            }
+
+            function showError(message) {
+                statusSpan.textContent = "❌";
+                statusText.textContent = "错误";
+                statusText.className = "";
+                dataPreview.innerHTML = `<div class="error">${message}</div>`;
+                progressBar.style.width = "0%";
+            }
+
+            // 页面加载时获取信息
+            loadQrInfo();
+        </script>
+    </body>
+</html>

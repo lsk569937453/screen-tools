@@ -1,6 +1,11 @@
 [package]
 name = "server"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+screenshots = "0.7"
+rqrr = "0.7"
+base64 = "0.22"
+anyhow = "1.0"
+image = "0.25"
