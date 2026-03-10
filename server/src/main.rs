@@ -189,7 +189,7 @@ fn restore_file(chunks: &[String]) -> Result<()> {
 fn generate_output_filename() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs();
 
     format!("received_file_{}", now)
