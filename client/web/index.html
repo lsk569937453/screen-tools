@@ -136,6 +136,30 @@
                 background: #5a6268;
             }
 
+            .jump-control {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin-top: 15px;
+                justify-content: center;
+            }
+
+            .jump-input {
+                width: 100px;
+                padding: 8px 12px;
+                font-size: 16px;
+                border: 2px solid #1e3c72;
+                border-radius: 8px;
+                text-align: center;
+                font-family: inherit;
+            }
+
+            .jump-input:focus {
+                outline: none;
+                border-color: #2a5298;
+                box-shadow: 0 0 0 3px rgba(30, 60, 114, 0.1);
+            }
+
             .progress {
                 width: 100%;
                 height: 6px;
@@ -237,6 +261,20 @@
                     重新开始
                 </button>
             </div>
+
+            <div class="jump-control">
+                <label for="jump-input">跳转到片段:</label>
+                <input
+                    type="number"
+                    id="jump-input"
+                    class="jump-input"
+                    min="1"
+                    max="9999"
+                    placeholder="序号"
+                    onkeypress="handleJumpKeypress(event)"
+                />
+                <button class="btn-primary" onclick="jumpToQr()">跳转</button>
+            </div>
         </div>
 
         <script>
@@ -271,6 +309,7 @@
 
                     totalQr = data.total;
                     totalSpan.textContent = totalQr;
+                    document.getElementById("jump-input").max = totalQr;
 
                     if (totalQr === 0) {
                         showError("未找到二维码文件，请先使用命令行生成二维码");
@@ -350,6 +389,36 @@
                 updateDisplay();
                 if (!isPlaying && hasStarted) {
                     startPlay();
+                }
+            }
+
+            function jumpToQr() {
+                const input = document.getElementById("jump-input");
+                const targetIndex = parseInt(input.value) - 1; // 转换为0-based索引
+
+                if (isNaN(targetIndex) || targetIndex < 0 || targetIndex >= totalQr) {
+                    alert(`请输入有效的片段号 (1-${totalQr})`);
+                    return;
+                }
+
+                currentIndex = targetIndex;
+                updateDisplay();
+
+                // 如果正在播放，继续播放；如果暂停，保持暂停
+                if (!isPlaying && hasStarted) {
+                    statusSpan.textContent = "⏸";
+                    statusText.textContent = `已跳转到第 ${targetIndex + 1} 片段`;
+                } else if (isPlaying) {
+                    statusSpan.textContent = "▶";
+                    statusText.textContent = `播放中 (第 ${targetIndex + 1} 片段)`;
+                }
+
+                input.value = ""; // 清空输入框
+            }
+
+            function handleJumpKeypress(event) {
+                if (event.key === "Enter") {
+                    jumpToQr();
                 }
             }
 

@@ -158,10 +158,16 @@ fn split_data(data: &str, chunk_size: usize) -> Vec<String> {
 
 /// 生成所有二维码 SVG 文件
 fn generate_qr_svgs(chunks: &[String], output_dir: &Path) -> Result<()> {
+    let total = chunks.len();
+
     for (idx, chunk) in chunks.iter().enumerate() {
+        // 格式: 序号/总数|实际数据
+        let seq_num = idx + 1;
+        let qr_data = format!("{}/{}|{}", seq_num, total, chunk);
+
         // 生成二维码
         let qr_code =
-            QrCode::new(chunk.as_bytes()).map_err(|e| anyhow!("生成二维码失败: {}", e))?;
+            QrCode::new(qr_data.as_bytes()).map_err(|e| anyhow!("生成二维码失败: {}", e))?;
 
         // 渲染为 SVG
         let svg_string = qr_code
@@ -180,8 +186,8 @@ fn generate_qr_svgs(chunks: &[String], output_dir: &Path) -> Result<()> {
         println!(
             "  [{:3}/{}] 生成 qr_{:03}.svg ({} bytes)",
             idx + 1,
-            chunks.len(),
-            idx + 1,
+            total,
+            seq_num,
             chunk.len()
         );
     }
