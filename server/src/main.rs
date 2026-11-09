@@ -6,13 +6,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const CAPTURE_INTERVAL_MS: u64 = 50; // 截屏间隔（毫秒）
 const IDLE_TIMEOUT_SECONDS: u64 = 3; // 无新数据超时时间（秒）
 const SAVE_FILE: &str = ".qr_session.json"; // 会话保存文件
+const SAVE_INTERVAL_SECONDS: u64 = 1; // 内存会话定时落盘间隔（秒）
 
 /// 带序号的数据块
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +55,11 @@ fn main_with_error(args: &[String]) -> Result<()> {
     println!("╔════════════════════════════════════════╗");
     println!("║       QR 码文件接收器                  ║");
     println!("╚════════════════════════════════════════╝");
+
+    // 打印会话文件的绝对路径，避免从不同工作目录启动时误以为没有保存
+    if let Ok(dir) = std::env::current_dir() {
+        println!("会话文件: {}", dir.join(SAVE_FILE).display());
+    }
     println!();
 
     // 尝试加载之前的会话
@@ -91,6 +97,8 @@ fn main_with_error(args: &[String]) -> Result<()> {
         .ok_or_else(|| anyhow!("没有找到屏幕"))?;
 
     let mut last_data_time = Instant::now();
+    let mut session_dirty = false;
+    let mut last_save = Instant::now();
     let mut loop_count = 0;
 
     loop {
@@ -117,6 +125,7 @@ fn main_with_error(args: &[String]) -> Result<()> {
                         // 更新总数信息
                         if expected_total.is_none() {
                             expected_total = Some(total);
+                            session_dirty = true;
                             println!("[信息] 总片段数: {}", total);
                         }
 
@@ -134,6 +143,7 @@ fn main_with_error(args: &[String]) -> Result<()> {
                         if !received_chunks.contains_key(&seq) {
                             received_chunks.insert(seq, chunk);
                             last_data_time = Instant::now();
+                            session_dirty = true;
 
                             println!(
                                 "[收到] 片段 #{:>3} | 数据大小: {} bytes | 已收集: {}/{}",
@@ -198,6 +208,22 @@ fn main_with_error(args: &[String]) -> Result<()> {
                 }
             }
             break;
+        }
+
+        // 定时把内存中的会话写入磁盘，避免进程被强杀时丢失已收集片段
+        if session_dirty && last_save.elapsed() >= Duration::from_secs(SAVE_INTERVAL_SECONDS) {
+            match save_session(&received_chunks, expected_total) {
+                Ok(()) => {
+                    session_dirty = false;
+                    last_save = Instant::now();
+                    println!("[保存] 已写入 {} 个片段", received_chunks.len());
+                }
+                Err(e) => {
+                    // 保留 dirty，下一秒再试；同时避免每个循环都刷屏
+                    last_save = Instant::now();
+                    println!("[警告] 定时保存会话失败: {}", e);
+                }
+            }
         }
 
         thread::sleep(Duration::from_millis(CAPTURE_INTERVAL_MS));
@@ -413,23 +439,48 @@ fn format_file_size(bytes: usize) -> String {
     }
 }
 
-/// 保存会话到文件
+/// 保存会话到默认文件
 fn save_session(chunks: &HashMap<usize, Chunk>, expected_total: Option<usize>) -> Result<()> {
+    save_session_to(Path::new(SAVE_FILE), chunks, expected_total)
+}
+
+/// 原子地保存会话到指定文件
+fn save_session_to(
+    path: &Path,
+    chunks: &HashMap<usize, Chunk>,
+    expected_total: Option<usize>,
+) -> Result<()> {
     let session = Session {
         chunks: chunks.clone(),
         expected_total,
     };
 
     let json = serde_json::to_string_pretty(&session)?;
-    let mut file = File::create(SAVE_FILE)?;
-    file.write_all(json.as_bytes())?;
+
+    // 先写同目录临时文件，再 rename，避免进程在写入中途被杀导致会话损坏
+    let tmp_path = {
+        let mut os = path.as_os_str().to_owned();
+        os.push(".tmp");
+        PathBuf::from(os)
+    };
+    {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.flush()?;
+    }
+    fs::rename(&tmp_path, path)?;
 
     Ok(())
 }
 
-/// 从文件加载会话
+/// 从默认文件加载会话
 fn load_session() -> Result<Session> {
-    let mut file = File::open(SAVE_FILE)?;
+    load_session_from(Path::new(SAVE_FILE))
+}
+
+/// 从指定文件加载会话
+fn load_session_from(path: &Path) -> Result<Session> {
+    let mut file = File::open(path)?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
 
@@ -446,4 +497,66 @@ fn find_missing_chunks(chunks: &HashMap<usize, Chunk>, total: usize) -> Vec<usiz
         }
     }
     missing
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_session_path() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "qr_session_test_{}_{}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).expect("创建临时目录失败");
+        dir.join("session.json")
+    }
+
+    #[test]
+    fn session_round_trip_is_atomic() {
+        let path = temp_session_path();
+
+        let mut chunks = HashMap::new();
+        chunks.insert(
+            1,
+            Chunk {
+                seq: 1,
+                total: 2,
+                data: "abc".to_string(),
+            },
+        );
+
+        save_session_to(&path, &chunks, Some(2)).expect("保存会话失败");
+
+        // 再保存一次，覆盖已存在的会话文件，验证 rename 的替换行为
+        let mut updated_chunks = chunks.clone();
+        updated_chunks.insert(
+            2,
+            Chunk {
+                seq: 2,
+                total: 2,
+                data: "def".to_string(),
+            },
+        );
+        save_session_to(&path, &updated_chunks, Some(2)).expect("覆盖保存会话失败");
+
+        let tmp_path = {
+            let mut os = path.as_os_str().to_owned();
+            os.push(".tmp");
+            PathBuf::from(os)
+        };
+        assert!(!tmp_path.exists(), "临时文件应在 rename 后消失");
+
+        let loaded = load_session_from(&path).expect("加载会话失败");
+        assert_eq!(loaded.chunks.len(), 2);
+        assert_eq!(loaded.chunks.get(&1).map(|c| c.data.as_str()), Some("abc"));
+        assert_eq!(loaded.chunks.get(&2).map(|c| c.data.as_str()), Some("def"));
+        assert_eq!(loaded.expected_total, Some(2));
+
+        let _ = fs::remove_dir_all(path.parent().expect("临时目录不存在"));
+    }
 }
