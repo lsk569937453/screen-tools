@@ -142,6 +142,10 @@ fn main_with_error(args: &[String]) -> Result<()> {
                                 received_chunks.len(),
                                 expected_total.unwrap_or(0)
                             );
+                        } else if is_resume {
+                            // 续传时屏幕上仍停在已收集的片段，说明发送端仍在工作；
+                            // 不能因为“没有新片段”而超时退出，继续等待缺失片段。
+                            last_data_time = Instant::now();
                         }
                     }
                     Err(e) => {
