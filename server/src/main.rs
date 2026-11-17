@@ -4,18 +4,25 @@ use image::GrayImage;
 use screenshots::Screen;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod win_capture;
+
+use win_capture::{Frame, WindowInfo};
 
 const CAPTURE_INTERVAL_MS: u64 = 50; // 截屏间隔（毫秒）
 const IDLE_TIMEOUT_SECONDS: u64 = 3; // 无新数据超时时间（秒）
 const SAVE_FILE: &str = ".qr_session.json"; // 会话保存文件
 const SAVE_INTERVAL_SECONDS: u64 = 1; // 内存会话定时落盘间隔（秒）
+const LOG_DIR: &str = "logs"; // 日志目录
+/// 默认抓取的进程名（部分匹配，能命中 HSRClient）；用 `--process` 或 `--fullscreen` 覆盖
+const DEFAULT_PROCESS: &str = "HSR";
 
 /// 带序号的数据块
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +45,16 @@ struct Options {
     clean: bool,
     verbose: bool,
     interval_ms: u64,
+    /// 按进程名抓窗口（不含 .exe，大小写不敏感的部分匹配）；默认 `HSR`
+    process: Option<String>,
+    /// 按窗口标题抓窗口（大小写不敏感的部分匹配）
+    window: Option<String>,
+    /// 抓整块屏幕（默认按进程抓窗口）
+    fullscreen: bool,
+    /// 只列出所有可见窗口后退出
+    list_windows: bool,
+    /// 无新片段多久后结束；`None` 表示永不超时
+    idle_timeout: Option<Duration>,
 }
 
 impl Default for Options {
@@ -47,27 +64,56 @@ impl Default for Options {
             clean: false,
             verbose: false,
             interval_ms: CAPTURE_INTERVAL_MS,
+            process: Some(DEFAULT_PROCESS.to_string()),
+            window: None,
+            fullscreen: false,
+            list_windows: false,
+            idle_timeout: Some(Duration::from_secs(IDLE_TIMEOUT_SECONDS)),
         }
     }
 }
 
 /// 一次截屏的检测结果
+///
+/// 注意：分块检测的瓦片互有重叠、同一张码可能被多条路径重复看到，
+/// 所以这里分别记录各路径的数字，而不是简单相加——"失败次数"并不等于"漏了几张码"。
 struct Batch {
-    /// 成功解码出的载荷（可能来自同一屏的多张二维码）
+    /// 成功解码出的载荷（多路取并集并去重）
     payloads: Vec<String>,
-    /// 检测到的二维码网格数量
-    grids: usize,
-    /// 网格存在但解码失败的个数
-    decode_failed: usize,
+    /// 整图检测的网格数（主路径，最接近"这一屏有几张码"）
+    full_grids: usize,
+    /// 整图检测解码成功的张数
+    full_decoded: usize,
+    /// 分块检测汇总：网格数与解码成功次数（瓦片重叠，会重复计）
+    tile_grids: usize,
+    tile_decoded: usize,
+    /// 放大重试汇总：网格数与解码成功张数
+    retry_grids: usize,
+    retry_decoded: usize,
+    /// 分块 / 放大重试比整图多补回来的张数（已去重）
+    extra: usize,
+    /// 本帧是否做过放大重试
+    retried: bool,
 }
 
 impl Batch {
     fn empty() -> Self {
         Self {
             payloads: Vec::new(),
-            grids: 0,
-            decode_failed: 0,
+            full_grids: 0,
+            full_decoded: 0,
+            tile_grids: 0,
+            tile_decoded: 0,
+            retry_grids: 0,
+            retry_decoded: 0,
+            extra: 0,
+            retried: false,
         }
+    }
+
+    /// 整图里检测到、但没解出来的张数（理论上应该补回来的量）
+    fn full_missed(&self) -> usize {
+        self.full_grids.saturating_sub(self.full_decoded)
     }
 }
 
@@ -77,15 +123,21 @@ static PANIC_WARNED: AtomicBool = AtomicBool::new(false);
 /// 把 panic 收敛成一行提示（rqrr 的断言 panic 已在检测处隔离）
 fn warn_panic_once(location: &str) {
     if !PANIC_WARNED.swap(true, Ordering::Relaxed) {
-        println!(
-            "[警告] 内部解码异常（已跳过该区域）: {}",
-            if location.is_empty() {
-                "未知位置"
-            } else {
-                location
-            }
+        log(
+            "警告",
+            format!(
+                "内部解码异常（已跳过该区域）: {}",
+                if location.is_empty() {
+                    "未知位置"
+                } else {
+                    location
+                }
+            ),
         );
-        println!("[警告] 若频繁出现，通常是屏幕上的二维码太小，请减少每屏张数");
+        log(
+            "警告",
+            "若频繁出现，通常是屏幕上的二维码太小，请减少每屏张数",
+        );
     }
 }
 
@@ -127,7 +179,246 @@ fn summarize_seqs(seqs: &[usize]) -> String {
         format!("[{},…] 共 {} 个", list.join(","), seqs.len())
     }
 }
+
+/// 缺失片段的预览：最多列 20 个，超出时用省略号表示（总数由调用方另行打印）
+fn summarize_missing(missing: &[usize]) -> String {
+    const LIMIT: usize = 20;
+    let preview: Vec<String> = missing
+        .iter()
+        .take(LIMIT)
+        .map(|seq| seq.to_string())
+        .collect();
+
+    if missing.len() <= LIMIT {
+        format!("[{}]", preview.join(","))
+    } else {
+        format!("[{},…]", preview.join(","))
+    }
+}
+
+/// 进程启动时刻：每行日志前缀打印相对运行时长，便于和轮播节奏对照
+static RUN_START: OnceLock<Instant> = OnceLock::new();
+
+/// 日志文件（`logs/server-<时间戳>.log`）；未初始化或写入失败时只走控制台
+static LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+
+/// 当前日志文件路径
+static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// 本机时间 `YYYY-MM-DD HH:MM:SS.mmm`
+#[cfg(windows)]
+fn wall_clock() -> String {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+
+    let mut time: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { GetLocalTime(&mut time) };
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        time.wYear,
+        time.wMonth,
+        time.wDay,
+        time.wHour,
+        time.wMinute,
+        time.wSecond,
+        time.wMilliseconds
+    )
+}
+
+/// 非 Windows 平台没有零依赖的本地时间 API，退化成 Unix 秒数（仍可定位先后顺序）
+#[cfg(not(windows))]
+fn wall_clock() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format!("{}.000", secs)
+}
+
+/// 日志文件名里的时间戳：`20261117-220634`
+fn log_file_stamp() -> String {
+    let digits: String = wall_clock()
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .take(14)
+        .collect();
+    if digits.len() == 14 {
+        format!("{}-{}", &digits[..8], &digits[8..])
+    } else {
+        digits
+    }
+}
+
+/// 创建 `logs/server-<时间戳>.log`，之后所有日志同时写入文件
+fn init_log_file(dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(dir)
+        .map_err(|e| anyhow!("创建日志目录 {} 失败: {}", dir.display(), e))?;
+
+    let path = dir.join(format!("server-{}.log", log_file_stamp()));
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| anyhow!("创建日志文件 {} 失败: {}", path.display(), e))?;
+
+    let _ = LOG_FILE.set(Mutex::new(Some(file)));
+    let _ = LOG_PATH.set(path.clone());
+    Ok(path)
+}
+
+/// 控制台是否也输出细节（`-v` 时打开）；日志文件永远输出全部细节
+static CONSOLE_VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// 追加一行到日志文件；未启用文件日志时静默跳过
+fn append_log_file(line: &str) {
+    let Some(lock) = LOG_FILE.get() else {
+        return;
+    };
+    let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(file) = guard.as_mut() {
+        // 逐行 flush：进程被强杀时也能看到最后发生的事
+        let _ = writeln!(file, "{}", line);
+        let _ = file.flush();
+    }
+}
+
+fn format_log_line(kind: &str, message: &str) -> String {
+    format!(
+        "[{}] [{:>8.3}s] [{}] {}",
+        wall_clock(),
+        uptime().as_secs_f64(),
+        kind,
+        message
+    )
+}
+
+/// 关键信息：控制台 + 日志文件双写（启动、配置、进度、超时、完成、错误、警告）
+fn log(kind: &str, message: impl std::fmt::Display) {
+    let line = format_log_line(kind, &message.to_string());
+    println!("{}", line);
+    append_log_file(&line);
+}
+
+/// 细节信息：只写日志文件；加 `-v` 时控制台也打印
+///
+/// 用于每秒心跳、每帧识别明细、调试计数、窗口几何变化、逐片段入库等
+/// 「排查时才需要」的内容，避免把控制台刷满。
+fn detail(kind: &str, message: impl std::fmt::Display) {
+    let line = format_log_line(kind, &message.to_string());
+    if CONSOLE_VERBOSE.load(Ordering::Relaxed) {
+        println!("{}", line);
+    }
+    append_log_file(&line);
+}
+
+/// 普通输出（横幅、清单等）：同样写入日志文件
+fn say(message: impl std::fmt::Display) {
+    let text = message.to_string();
+    println!("{}", text);
+    append_log_file(&text);
+}
+
+/// 当前运行时长
+fn uptime() -> Duration {
+    RUN_START.get_or_init(Instant::now).elapsed()
+}
+
+/// 文件大小的可读描述（读不到时返回"大小未知"）
+fn describe_file_size(path: &Path) -> String {
+    match fs::metadata(path) {
+        Ok(meta) => format_file_size(meta.len() as usize),
+        Err(_) => "大小未知".to_string(),
+    }
+}
+
+/// 运行期统计（仅用于日志，不影响业务逻辑）
+#[derive(Default)]
+struct Stats {
+    /// 主循环轮数
+    loops: u64,
+    /// 成功截屏帧数
+    captured: u64,
+    /// 截屏失败次数
+    capture_errors: u64,
+    /// 与上一帧完全相同、被跳过的帧数
+    frames_unchanged: u64,
+    /// 真正做过二维码识别的帧数
+    frames_scanned: u64,
+    /// 检测到至少一个二维码网格的帧数
+    frames_with_grids: u64,
+    /// 整图检测到的网格总数（最接近"扫过多少张码"）
+    grids: u64,
+    /// 累计解码成功的二维码张数（多路去重后）
+    decoded: u64,
+    /// 整图检测到但没解出的张数（可能被分块/放大补回）
+    full_missed: u64,
+    /// 分块 / 放大重试额外补回的张数
+    extra: u64,
+    /// 片段数据解析失败次数
+    parse_errors: u64,
+    /// 本次运行新入库的片段数
+    new_seqs: u64,
+    /// 屏幕上重复出现、但已经收集过的二维码张数
+    duplicate_payloads: u64,
+    /// 截屏累计耗时（毫秒）
+    capture_ms: u128,
+    /// 识别累计耗时（毫秒）
+    detect_ms: u128,
+}
+
+impl Stats {
+    fn avg_capture_ms(&self) -> f64 {
+        if self.captured == 0 {
+            0.0
+        } else {
+            self.capture_ms as f64 / self.captured as f64
+        }
+    }
+
+    fn avg_detect_ms(&self) -> f64 {
+        if self.frames_scanned == 0 {
+            0.0
+        } else {
+            self.detect_ms as f64 / self.frames_scanned as f64
+        }
+    }
+
+    /// 每秒一次的心跳日志
+    fn report(
+        &self,
+        uptime: Duration,
+        received: usize,
+        total: Option<usize>,
+        idle: Duration,
+    ) -> String {
+        format!(
+            "运行 {:.1}s | 循环 {} 次 | 截屏 {} 帧（失败 {}，未变化 {}） | 识别 {} 帧: 整图网格 {} 解码 {}（漏解 {}，补回 {}） | 均值 截屏 {:.1}ms 识别 {:.1}ms | 片段 {}/{}（本次 +{}，重复 {}） | 空闲 {:.1}s",
+            uptime.as_secs_f64(),
+            self.loops,
+            self.captured,
+            self.capture_errors,
+            self.frames_unchanged,
+            self.frames_scanned,
+            self.grids,
+            self.decoded,
+            self.full_missed,
+            self.extra,
+            self.avg_capture_ms(),
+            self.avg_detect_ms(),
+            received,
+            total.map(|t| t.to_string()).unwrap_or_else(|| "?".to_string()),
+            self.new_seqs,
+            self.duplicate_payloads,
+            idle.as_secs_f64(),
+        )
+    }
+}
+
 fn main() {
+    // 尽早开启 DPI 感知：窗口坐标与截图像素必须处于同一坐标系
+    let dpi_aware = win_capture::enable_dpi_awareness();
+
     // rqrr 的断言 panic 已在检测处隔离，这里把默认的 panic 输出收敛成一行提示，
     // 避免每帧刷屏
     std::panic::set_hook(Box::new(|info| {
@@ -140,101 +431,365 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
 
-    if let Err(e) = main_with_error(&args) {
-        println!("\n错误: {}", e);
+    if let Err(e) = main_with_error(&args, dpi_aware) {
+        log("错误", &e);
+        say("\n接收失败，详见上方日志与 logs/ 目录");
         std::process::exit(1);
     }
 }
 
-fn main_with_error(args: &[String]) -> Result<()> {
+fn main_with_error(args: &[String], dpi_aware: bool) -> Result<()> {
+    // 日志时间前缀从逻辑起点开始计算
+    RUN_START.get_or_init(Instant::now);
+
     // 解析命令行参数
     let opts = parse_options(args)?;
     let is_resume = opts.resume;
+    CONSOLE_VERBOSE.store(opts.verbose, Ordering::Relaxed);
+
+    // 日志文件先就位：之后所有输出都是「控制台 + 文件」双写
+    match init_log_file(Path::new(LOG_DIR)) {
+        Ok(path) => {
+            if let Ok(dir) = std::env::current_dir() {
+                log("日志", format!("日志文件: {}", dir.join(&path).display()));
+            } else {
+                log("日志", format!("日志文件: {}", path.display()));
+            }
+        }
+        Err(e) => {
+            // 日志文件写不了不能影响接收本身，退回只输出到控制台
+            println!("警告: {}，日志只会输出到控制台", e);
+        }
+    }
+
+    detail(
+        "信息",
+        format!(
+            "DPI 感知: {}（窗口捕获与截图坐标需要处于同一坐标系）",
+            if dpi_aware { "已开启" } else { "已由系统设置" }
+        ),
+    );
 
     // 清除保存的会话
     if opts.clean {
         if PathBuf::from(SAVE_FILE).exists() {
             fs::remove_file(SAVE_FILE)?;
-            println!("已清除保存的会话");
+            log("会话", format!("已清除保存的会话 {}", SAVE_FILE));
+        } else {
+            log("会话", "没有可清除的会话文件");
         }
         return Ok(());
     }
 
-    println!("╔════════════════════════════════════════╗");
-    println!("║       QR 码文件接收器                  ║");
-    println!("╚════════════════════════════════════════╝");
+    // 只列窗口：排查"到底该匹配哪个进程/标题"
+    if opts.list_windows {
+        return list_windows_report();
+    }
+
+    say("╔════════════════════════════════════════╗");
+    say("║       QR 码文件接收器                  ║");
+    say("╚════════════════════════════════════════╝");
 
     // 打印会话文件的绝对路径，避免从不同工作目录启动时误以为没有保存
     if let Ok(dir) = std::env::current_dir() {
-        println!("会话文件: {}", dir.join(SAVE_FILE).display());
+        say(format!("会话文件: {}", dir.join(SAVE_FILE).display()));
     }
-    println!();
+    say("");
 
     // 尝试加载之前的会话
     let (mut received_chunks, mut expected_total) = if is_resume {
         match load_session() {
             Ok(session) => {
-                println!("✓ 已加载上次会话");
-                println!("  已收集: {} 片段", session.chunks.len());
-                if let Some(total) = session.expected_total {
-                    println!("  总数: {} 片段", total);
+                let count = session.chunks.len();
+                // 缺失片段只算一次：首行统计和"前 20 个"都用它
+                let missing = session
+                    .expected_total
+                    .map(|total| (total, find_missing_chunks(&session.chunks, total)));
+
+                log(
+                    "会话",
+                    format!(
+                        "续传: 已收集 {} 个片段{}",
+                        count,
+                        match &missing {
+                            Some((total, list)) => {
+                                format!("，预期 {}，缺失 {}", total, list.len())
+                            }
+                            None => "（上次没有记录总数）".to_string(),
+                        }
+                    ),
+                );
+
+                match &missing {
+                    Some((total, list)) if list.is_empty() => log(
+                        "会话",
+                        format!("没有缺失片段（已收集 {}/{}），可以直接开始接收", count, total),
+                    ),
+                    Some((_, list)) if list.len() <= 20 => {
+                        log("会话", format!("缺失片段: {}", summarize_missing(list)))
+                    }
+                    Some((_, list)) => log(
+                        "会话",
+                        format!(
+                            "缺失片段(前20个): {}（共 {} 个）",
+                            summarize_missing(list),
+                            list.len()
+                        ),
+                    ),
+                    None => log(
+                        "会话",
+                        "上次没有记录总数，暂时无法列出缺失片段（收到首个码后即可确定）",
+                    ),
                 }
+
+                detail(
+                    "会话",
+                    format!(
+                        "会话文件 {}（{}）",
+                        SAVE_FILE,
+                        describe_file_size(Path::new(SAVE_FILE))
+                    ),
+                );
+
+                // 校验会话自身的一致性：总数/序号矛盾会让"怎么扫都补不齐"
+                if !session.chunks.is_empty() {
+                    let mut totals: Vec<usize> =
+                        session.chunks.values().map(|chunk| chunk.total).collect();
+                    totals.sort_unstable();
+                    totals.dedup();
+                    if totals.len() > 1 {
+                        log("警告", format!("会话里的片段总数不一致: {:?}", totals));
+                    }
+
+                    let mut seqs: Vec<usize> = session.chunks.keys().copied().collect();
+                    seqs.sort_unstable();
+                    let max_seq = seqs.last().copied().unwrap_or(0);
+                    let max_total = totals.iter().copied().max().unwrap_or(0);
+                    detail(
+                        "会话",
+                        format!(
+                            "片段序号范围: #{} ~ #{}；其中数据长度最小 {} / 最大 {} 字符",
+                            seqs.first().copied().unwrap_or(0),
+                            max_seq,
+                            session
+                                .chunks
+                                .values()
+                                .map(|chunk| chunk.data.len())
+                                .min()
+                                .unwrap_or(0),
+                            session
+                                .chunks
+                                .values()
+                                .map(|chunk| chunk.data.len())
+                                .max()
+                                .unwrap_or(0)
+                        ),
+                    );
+
+                    if max_total > 0 && max_seq > max_total {
+                        log(
+                            "警告",
+                            format!("会话中有序号超出总数的片段: seq={} > total={}", max_seq, max_total),
+                        );
+                    }
+                }
+
                 (session.chunks, session.expected_total)
             }
             Err(e) => {
-                println!("警告: 无法加载会话: {}，将重新开始", e);
+                log(
+                    "警告",
+                    format!("无法加载会话 {}: {}，将重新开始", SAVE_FILE, e),
+                );
                 (HashMap::new(), None)
             }
         }
     } else {
         // 检查是否有旧会话
         if PathBuf::from(SAVE_FILE).exists() {
-            println!("提示: 发现之前的会话，使用 --resume 参数可继续");
+            log(
+                "提示",
+                format!(
+                    "发现之前的会话 {}（{}），使用 --resume 参数可继续接收",
+                    SAVE_FILE,
+                    describe_file_size(Path::new(SAVE_FILE))
+                ),
+            );
         }
         (HashMap::new(), None)
     };
 
-    println!();
-    println!("开始监听屏幕二维码...");
+    say("");
+    log("信息", "开始监听二维码");
 
-    // 获取主屏幕
-    let screen = Screen::all()
-        .map_err(|e| anyhow!("获取屏幕失败: {}", e))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("没有找到屏幕"))?;
+    log(
+        "配置",
+        format!(
+            "截屏间隔 {} ms | 空闲超时 {} | 会话落盘间隔 {} s | 详细日志 {}",
+            opts.interval_ms,
+            match opts.idle_timeout {
+                Some(limit) => format!("{} s", limit.as_secs()),
+                None => "关闭（--idle-timeout 0）".to_string(),
+            },
+            SAVE_INTERVAL_SECONDS,
+            if opts.verbose {
+                "开"
+            } else {
+                "关（加 -v 查看每帧明细）"
+            }
+        ),
+    );
 
+    // 列出所有屏幕：多屏场景下一眼看出窗口/整屏落在哪块屏
+    let screens = Screen::all().map_err(|e| anyhow!("获取屏幕失败: {}", e))?;
+    detail("信息", format!("检测到 {} 块屏幕", screens.len()));
+    for (index, item) in screens.iter().enumerate() {
+        let info = &item.display_info;
+        detail(
+            "屏幕",
+            format!(
+                "#{} id={} 位置=({},{}) 尺寸={}x{} 缩放={:.2} 主屏={}",
+                index + 1,
+                info.id,
+                info.x,
+                info.y,
+                info.width,
+                info.height,
+                info.scale_factor,
+                if info.is_primary { "是" } else { "否" }
+            ),
+        );
+    }
+
+    let mut source = open_capture_source(&opts, screens)?;
+
+    let mut stats = Stats::default();
     let mut last_data_time = Instant::now();
+    let mut last_frame_change = Instant::now();
     let mut session_dirty = false;
     let mut last_save = Instant::now();
-    let mut loop_count = 0;
+    let mut last_report = Instant::now();
+    let mut last_progress = Instant::now();
+    let mut last_no_grid_warn: Option<Instant> = None;
+    let mut last_decode_fail_warn: Option<Instant> = None;
+    let mut last_frozen_warn: Option<Instant> = None;
+    let mut first_capture_logged = false;
     // 上一帧的原始像素，用于跳过"画面没变"的重复检测
     let mut last_frame: Vec<u8> = Vec::new();
 
     loop {
-        loop_count += 1;
-        if loop_count % 25 == 0 {
-            // 每 5 秒输出一次状态
-            if let Some(total) = expected_total {
-                println!("[运行中] 已收集: {}/{} 片段", received_chunks.len(), total);
-            } else {
-                println!("[运行中] 已收集: {} 片段 (总数未知)", received_chunks.len());
+        stats.loops += 1;
+
+        // 每秒一次的状态心跳：只进日志文件（-v 时也打到控制台）
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            last_report = Instant::now();
+            detail(
+                "统计",
+                stats.report(
+                    uptime(),
+                    received_chunks.len(),
+                    expected_total,
+                    last_data_time.elapsed(),
+                ),
+            );
+
+            // 控制台每 10 秒给一行进度，长时间传输时能看到还在动
+            if last_progress.elapsed() >= Duration::from_secs(10) {
+                last_progress = Instant::now();
+                log(
+                    "进度",
+                    format!(
+                        "已收集 {}/{}（本次 +{}，运行 {:.0}s）",
+                        received_chunks.len(),
+                        expected_total
+                            .map(|total| total.to_string())
+                            .unwrap_or_else(|| "?".to_string()),
+                        stats.new_seqs,
+                        uptime().as_secs_f64()
+                    ),
+                );
+            }
+
+            // 一张网格都没检测到：多半是页面没在播放、不在捕获范围内，或被遮挡
+            if stats.frames_with_grids == 0
+                && last_data_time.elapsed() >= Duration::from_secs(5)
+                && last_no_grid_warn.is_none_or(|t| t.elapsed() >= Duration::from_secs(15))
+            {
+                last_no_grid_warn = Some(Instant::now());
+                log(
+                    "提示",
+                    format!(
+                        "已识别 {} 帧但没有任何二维码网格（画面变化 {} 次）：确认轮播页面正在播放、位于捕获范围内且未被遮挡",
+                        stats.frames_scanned,
+                        stats.captured.saturating_sub(stats.frames_unchanged)
+                    ),
+                );
+            }
+
+            // 画面长时间完全不变：轮播停了、暂停了，或者捕获到的根本不是页面
+            if !last_frame.is_empty()
+                && last_frame_change.elapsed() >= Duration::from_secs(5)
+                && last_frozen_warn.is_none_or(|t| t.elapsed() >= Duration::from_secs(30))
+            {
+                last_frozen_warn = Some(Instant::now());
+                log(
+                    "提示",
+                    format!(
+                        "画面已 {:.1}s 没有任何变化：轮播可能已停止/暂停，或捕获窗口被遮挡",
+                        last_frame_change.elapsed().as_secs_f64()
+                    ),
+                );
             }
         }
 
-        // 截屏
-        let screenshot = match screen.capture() {
+        // 截屏（整屏或目标窗口客户区）
+        let capture_started = Instant::now();
+        let screenshot = match source.capture() {
             Ok(screenshot) => screenshot,
             Err(e) => {
-                println!("[错误] 截屏失败: {}", e);
+                stats.capture_errors += 1;
+                // 截屏失败可能每帧都发生，这里限流输出，避免刷屏掩盖其它日志
+                if stats.capture_errors <= 3 || stats.capture_errors % 50 == 0 {
+                    log(
+                        "错误",
+                        format!("截屏失败（累计 {} 次）: {}", stats.capture_errors, e),
+                    );
+                }
+                // 窗口模式下连续失败基本意味着窗口已关闭/最小化，继续重试只会刷屏
+                if source.is_window() && stats.capture_errors >= 5 {
+                    return Err(anyhow!(
+                        "窗口截图连续失败 {} 次，已停止：{}",
+                        stats.capture_errors,
+                        e
+                    ));
+                }
                 thread::sleep(Duration::from_millis(opts.interval_ms));
                 continue;
             }
         };
+        stats.captured += 1;
+        let capture_elapsed = capture_started.elapsed();
+        stats.capture_ms += capture_elapsed.as_millis();
 
         let width = screenshot.width() as usize;
         let height = screenshot.height() as usize;
         let rgba_data = screenshot.rgba();
+
+        // 首次截屏记录真实分辨率：缩放/多屏问题一看就知道
+        if !first_capture_logged {
+            first_capture_logged = true;
+            log(
+                "信息",
+                format!(
+                    "首次截屏: {}x{}（{} 字节 rgba，耗时 {}ms，来源 {}）",
+                    width,
+                    height,
+                    rgba_data.len(),
+                    capture_elapsed.as_millis(),
+                    source.describe()
+                ),
+            );
+        }
 
         // 画面与上一帧完全相同时跳过检测：二维码轮播每 300ms 才翻一页，
         // 中间的重复帧占绝大多数，跳过它们能省下大量 CPU。
@@ -242,74 +797,167 @@ fn main_with_error(args: &[String]) -> Result<()> {
         if frame_changed {
             last_frame.clear();
             last_frame.extend_from_slice(rgba_data);
+            last_frame_change = Instant::now();
+        } else {
+            stats.frames_unchanged += 1;
         }
 
         if frame_changed {
-            match detect_from_rgba(rgba_data, width, height, opts.verbose) {
-                Ok(batch) if !batch.payloads.is_empty() => {
-                    let had_total = expected_total.is_some();
-                    let outcome = process_payloads(
-                        &batch.payloads,
-                        &mut received_chunks,
-                        &mut expected_total,
+            let detect_started = Instant::now();
+            let detected = detect_from_rgba(rgba_data, width, height, opts.verbose);
+            let detect_elapsed = detect_started.elapsed();
+            stats.detect_ms += detect_elapsed.as_millis();
+
+            match detected {
+                Ok(batch) => {
+                    stats.frames_scanned += 1;
+                    stats.grids += batch.full_grids as u64;
+                    stats.decoded += batch.payloads.len() as u64;
+                    stats.full_missed += batch.full_missed() as u64;
+                    stats.extra += batch.extra as u64;
+                    if batch.full_grids > 0 || !batch.payloads.is_empty() {
+                        stats.frames_with_grids += 1;
+                    }
+
+                    // 各路径分别是多少：整图是主路径，"分块/放大"只在补漏时才有数字
+                    detail(
+                        "帧",
+                        format!(
+                            "{}x{} | 整图 网格 {} / 解码 {} | 分块 网格 {} / 解码 {} | 放大重试 {}（网格 {} / 解码 {}）| 合并解码 {}（额外补回 {}）| 截屏 {}ms 识别 {}ms",
+                            width,
+                            height,
+                            batch.full_grids,
+                            batch.full_decoded,
+                            batch.tile_grids,
+                            batch.tile_decoded,
+                            if batch.retried { "是" } else { "否" },
+                            batch.retry_grids,
+                            batch.retry_decoded,
+                            batch.payloads.len(),
+                            batch.extra,
+                            capture_elapsed.as_millis(),
+                            detect_elapsed.as_millis()
+                        ),
                     );
 
-                    // 首次确定总数
-                    if !had_total {
-                        if let Some(total) = expected_total {
-                            println!("[信息] 总片段数: {}", total);
-                            session_dirty = true;
-                        }
-                    }
-
-                    for line in &outcome.errors {
-                        println!("[警告] {}", line);
-                    }
-
-                    if outcome.conflicts > 0 {
-                        println!(
-                            "[警告] 本帧有 {} 张码的总数与预期 ({}) 不符",
-                            outcome.conflicts,
-                            expected_total.unwrap_or(0)
+                    // 检测到网格却一张都解不出：这是"扫了但没数据"最典型的原因，必须留痕
+                    if batch.full_grids > 0
+                        && batch.payloads.is_empty()
+                        && last_decode_fail_warn
+                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(5))
+                    {
+                        last_decode_fail_warn = Some(Instant::now());
+                        log(
+                            "警告",
+                            format!(
+                                "本帧整图检测到 {} 个二维码网格但一张都没解出（累计: 网格 {} / 漏解 {}，补回 {}）：通常是二维码太小、被遮挡或分辨率不足",
+                                batch.full_grids, stats.grids, stats.full_missed, stats.extra
+                            ),
                         );
                     }
 
-                    if !outcome.new_seqs.is_empty() {
-                        last_data_time = Instant::now();
-                        session_dirty = true;
-
-                        if opts.verbose {
-                            for &seq in &outcome.new_seqs {
-                                if let Some(chunk) = received_chunks.get(&seq) {
-                                    println!(
-                                        "[收到] 片段 #{:>3} | 数据大小: {} bytes",
-                                        seq,
-                                        chunk.data.len()
-                                    );
+                    // 整图有漏，但分块/放大全补回来了：只是记录，不用告警
+                    if batch.full_missed() > 0 && !batch.payloads.is_empty() {
+                        detail(
+                            "调试",
+                            format!(
+                                "整图漏解 {} 张，分块/放大补回 {} 张，本帧最终拿到 {} 张{}",
+                                batch.full_missed(),
+                                batch.extra,
+                                batch.payloads.len(),
+                                if batch.payloads.len() >= batch.full_grids {
+                                    "（已补齐）"
+                                } else {
+                                    "（仍缺，可能二维码太小）"
                                 }
+                            ),
+                        );
+                    }
+
+                    if !batch.payloads.is_empty() {
+                        let had_total = expected_total.is_some();
+                        let outcome = process_payloads(
+                            &batch.payloads,
+                            &mut received_chunks,
+                            &mut expected_total,
+                        );
+
+                        stats.parse_errors += outcome.errors.len() as u64;
+
+                        // 首次确定总数
+                        if !had_total {
+                            if let Some(total) = expected_total {
+                                log("信息", format!("总片段数: {}", total));
+                                session_dirty = true;
                             }
                         }
 
-                        println!(
-                            "[批次] 本帧 {} 张码 (解码失败 {}) → 新增 {} 个片段 {} | 已收集: {}/{}",
-                            batch.payloads.len(),
-                            batch.decode_failed,
-                            outcome.new_seqs.len(),
-                            summarize_seqs(&outcome.new_seqs),
-                            received_chunks.len(),
-                            expected_total.unwrap_or(0)
-                        );
-                    } else if is_resume {
-                        // 续传时屏幕上仍停在已收集的片段，说明发送端仍在工作；
-                        // 不能因为“没有新片段”而超时退出，继续等待缺失片段。
-                        last_data_time = Instant::now();
+                        for line in &outcome.errors {
+                            log("警告", line);
+                        }
+
+                        if outcome.conflicts > 0 {
+                            log(
+                                "警告",
+                                format!(
+                                    "本帧有 {} 张码的总数与预期 ({}) 不符",
+                                    outcome.conflicts,
+                                    expected_total.unwrap_or(0)
+                                ),
+                            );
+                        }
+
+                        if !outcome.new_seqs.is_empty() {
+                            last_data_time = Instant::now();
+                            session_dirty = true;
+                            stats.new_seqs += outcome.new_seqs.len() as u64;
+
+                            for &seq in &outcome.new_seqs {
+                                if let Some(chunk) = received_chunks.get(&seq) {
+                                    detail(
+                                        "收到",
+                                        format!(
+                                            "#{:>5} | {} 字符 | 总数 {}",
+                                            seq,
+                                            chunk.data.len(),
+                                            chunk.total
+                                        ),
+                                    );
+                                }
+                            }
+
+                            detail(
+                                "批次",
+                                format!(
+                                    "本帧 {} 张码 → 新增 {} 个片段 {} | 已收集: {}/{}",
+                                    batch.payloads.len(),
+                                    outcome.new_seqs.len(),
+                                    summarize_seqs(&outcome.new_seqs),
+                                    received_chunks.len(),
+                                    expected_total.unwrap_or(0)
+                                ),
+                            );
+                        } else {
+                            stats.duplicate_payloads += batch.payloads.len() as u64;
+                            if is_resume {
+                                // 续传时屏幕上仍停在已收集的片段，说明发送端仍在工作；
+                                // 不能因为“没有新片段”而超时退出，继续等待缺失片段。
+                                last_data_time = Instant::now();
+                            }
+                            detail(
+                                "批次",
+                                format!(
+                                    "本帧 {} 张码全部是已收集片段 | 已收集: {}/{}",
+                                    batch.payloads.len(),
+                                    received_chunks.len(),
+                                    expected_total.unwrap_or(0)
+                                ),
+                            );
+                        }
                     }
                 }
-                Ok(_) => {
-                    // 未检测到二维码，继续
-                }
                 Err(e) => {
-                    println!("[错误] {}", e);
+                    log("错误", format!("识别失败: {}", e));
                 }
             }
         }
@@ -317,41 +965,79 @@ fn main_with_error(args: &[String]) -> Result<()> {
         // 检查是否接收完成
         if let Some(total) = expected_total {
             if received_chunks.len() == total {
-                println!();
-                println!("所有片段已接收完成！({}/{})", received_chunks.len(), total);
+                say("");
+                log(
+                    "完成",
+                    format!("所有片段已接收完成！({}/{})", received_chunks.len(), total),
+                );
                 break;
             }
         }
 
         // 检查是否超时（没有新数据）
-        if !received_chunks.is_empty()
-            && last_data_time.elapsed() > Duration::from_secs(IDLE_TIMEOUT_SECONDS)
-        {
+        let idle_timeout = opts.idle_timeout;
+        let idle_expired = idle_timeout.is_some_and(|limit| last_data_time.elapsed() > limit);
+        if !received_chunks.is_empty() && idle_expired {
             if let Some(total) = expected_total {
-                println!();
-                println!(
-                    "数据传输超时，已收集 {}/{} 片段",
-                    received_chunks.len(),
-                    total
+                say("");
+                log(
+                    "超时",
+                    format!(
+                        "{} 内没有收到新片段（本次新增 {} 个），已收集 {}/{}",
+                        idle_timeout
+                            .map(|limit| format!("{:.1}s", limit.as_secs_f64()))
+                            .unwrap_or_else(|| "-".to_string()),
+                        stats.new_seqs,
+                        received_chunks.len(),
+                        total
+                    ),
                 );
+
+                // 把最可能的原因直接写出来，省得再去猜
+                if stats.frames_with_grids == 0 {
+                    log(
+                        "提示",
+                        "整个过程没有检测到任何二维码网格：轮播页面可能没在播放、不在捕获范围内或被遮挡",
+                    );
+                } else if stats.decoded == 0 {
+                    log(
+                        "提示",
+                        format!(
+                            "检测到 {} 个网格但一张都没解出：二维码太小，建议把每屏张数调到 1~2 张后重播",
+                            stats.grids
+                        ),
+                    );
+                } else if stats.new_seqs == 0 {
+                    log(
+                        "提示",
+                        "屏幕上出现的都是已收集片段：请让发送端跳到缺失片段（或勾选循环播放）后继续",
+                    );
+                }
 
                 // 如果有缺失片段，保存会话并显示缺失信息
                 if received_chunks.len() < total {
                     save_session(&received_chunks, expected_total)?;
+                    log(
+                        "保存",
+                        format!(
+                            "会话已写入 {}（{}）",
+                            SAVE_FILE,
+                            describe_file_size(Path::new(SAVE_FILE))
+                        ),
+                    );
 
                     let missing = find_missing_chunks(&received_chunks, total);
-                    println!();
-                    println!("═ 缺失片段详情 ═");
-                    if missing.len() <= 20 {
-                        println!("缺失: {:?}", missing);
-                    } else {
-                        println!("缺失: {} 个片段", missing.len());
-                        println!("前20个: {:?}", &missing[..20]);
-                    }
-                    println!();
-                    println!("会话已保存到: {}", SAVE_FILE);
-                    println!("下次运行使用: ./server --resume  继续接收");
-                    println!();
+                    say("");
+                    say("═ 缺失片段详情 ═");
+                    say(format!(
+                        "缺失 {} 个片段: {}",
+                        missing.len(),
+                        summarize_missing(&missing)
+                    ));
+                    say("");
+                    say(format!("会话已保存到: {}", SAVE_FILE));
+                    say("继续接收: ./server --resume   （建议加 --idle-timeout 0 长时间等待）");
+                    say("");
                 }
             }
             break;
@@ -363,12 +1049,20 @@ fn main_with_error(args: &[String]) -> Result<()> {
                 Ok(()) => {
                     session_dirty = false;
                     last_save = Instant::now();
-                    println!("[保存] 已写入 {} 个片段", received_chunks.len());
+                    detail(
+                        "保存",
+                        format!(
+                            "已写入 {} 个片段 → {}（{}）",
+                            received_chunks.len(),
+                            SAVE_FILE,
+                            describe_file_size(Path::new(SAVE_FILE))
+                        ),
+                    );
                 }
                 Err(e) => {
                     // 保留 dirty，下一秒再试；同时避免每个循环都刷屏
                     last_save = Instant::now();
-                    println!("[警告] 定时保存会话失败: {}", e);
+                    log("警告", format!("定时保存会话失败: {}", e));
                 }
             }
         }
@@ -376,8 +1070,32 @@ fn main_with_error(args: &[String]) -> Result<()> {
         thread::sleep(Duration::from_millis(opts.interval_ms));
     }
 
+    say("");
+    log(
+        "汇总",
+        format!(
+            "运行 {:.1}s | 截屏 {} 帧（失败 {}，未变化 {}）| 识别 {} 帧 | 整图网格 {} / 解码 {} / 漏解 {}（补回 {}）/ 解析错误 {} | 本次新增 {} 个片段 | 当前 {}/{}",
+            uptime().as_secs_f64(),
+            stats.captured,
+            stats.capture_errors,
+            stats.frames_unchanged,
+            stats.frames_scanned,
+            stats.grids,
+            stats.decoded,
+            stats.full_missed,
+            stats.extra,
+            stats.parse_errors,
+            stats.new_seqs,
+            received_chunks.len(),
+            expected_total
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "?".to_string())
+        ),
+    );
+
     // 重组数据
     if received_chunks.is_empty() {
+        log("错误", "没有收到任何片段，无法重组文件");
         return Err(anyhow!("未接收到任何数据"));
     }
 
@@ -393,7 +1111,7 @@ fn main_with_error(args: &[String]) -> Result<()> {
 
 /// 解析命令行选项
 ///
-/// 用法: `server [--resume] [--clean] [--verbose] [--interval-ms N]`
+/// 用法: `server [--resume] [--clean] [--process 名称] [--window 标题] [--list-windows]`
 fn parse_options(args: &[String]) -> Result<Options> {
     let mut opts = Options::default();
 
@@ -403,24 +1121,36 @@ fn parse_options(args: &[String]) -> Result<Options> {
             "--resume" => opts.resume = true,
             "--clean" => opts.clean = true,
             "-v" | "--verbose" => opts.verbose = true,
+            "--list-windows" => opts.list_windows = true,
             "--interval-ms" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| anyhow!("--interval-ms 缺少参数值"))?;
+                let value = next_value(&mut iter, "--interval-ms")?;
                 opts.interval_ms = parse_interval_ms(value)?;
             }
             other if other.starts_with("--interval-ms=") => {
                 opts.interval_ms = parse_interval_ms(&other["--interval-ms=".len()..])?;
             }
+            "--process" => opts.process = Some(next_value(&mut iter, "--process")?.to_string()),
+            other if other.starts_with("--process=") => {
+                opts.process = Some(other["--process=".len()..].to_string());
+            }
+            "--window" => opts.window = Some(next_value(&mut iter, "--window")?.to_string()),
+            other if other.starts_with("--window=") => {
+                opts.window = Some(other["--window=".len()..].to_string());
+            }
+            "--idle-timeout" => {
+                let value = next_value(&mut iter, "--idle-timeout")?;
+                opts.idle_timeout = parse_idle_timeout(value)?;
+            }
+            other if other.starts_with("--idle-timeout=") => {
+                opts.idle_timeout = parse_idle_timeout(&other["--idle-timeout=".len()..])?;
+            }
+            "--fullscreen" | "--screen" => {
+                opts.fullscreen = true;
+                opts.process = None;
+                opts.window = None;
+            }
             "-h" | "--help" => {
-                println!("用法: server [--resume] [--clean] [--verbose] [--interval-ms N]");
-                println!("  --resume        继续上次未完成的会话");
-                println!("  --clean         清除保存的会话");
-                println!("  --verbose       输出每张二维码的解码细节");
-                println!(
-                    "  --interval-ms   截屏间隔毫秒数（默认 {}）",
-                    CAPTURE_INTERVAL_MS
-                );
+                print_usage();
                 std::process::exit(0);
             }
             other if other.starts_with('-') && other.len() > 1 => {
@@ -430,7 +1160,56 @@ fn parse_options(args: &[String]) -> Result<Options> {
         }
     }
 
+    if opts.process.as_deref() == Some("") || opts.window.as_deref() == Some("") {
+        return Err(anyhow!("--process / --window 不能为空"));
+    }
+    // 指定 --fullscreen 之后又写目标窗口，多半是命令行写错了，直接报出来
+    if opts.fullscreen && (opts.process.is_some() || opts.window.is_some()) {
+        return Err(anyhow!("--fullscreen 不能与 --process / --window 同时使用"));
+    }
+
     Ok(opts)
+}
+
+fn print_usage() {
+    println!("用法: server [选项]");
+    println!();
+    println!("接收相关:");
+    println!("  --resume             继续上次未完成的会话");
+    println!("  --clean              清除保存的会话");
+    println!(
+        "  --interval-ms <N>    截屏间隔毫秒数（默认 {}）",
+        CAPTURE_INTERVAL_MS
+    );
+    println!(
+        "  --idle-timeout <S>   无新片段多少秒后结束（默认 {}，0 表示不超时）",
+        IDLE_TIMEOUT_SECONDS
+    );
+    println!();
+    println!(
+        "抓取范围（默认按进程 {} 抓窗口，后台截图，不需要窗口在前台）:",
+        DEFAULT_PROCESS
+    );
+    println!("  --process <名称>     按进程名抓窗口（不含 .exe，允许部分匹配）");
+    println!("  --window <标题>      按窗口标题抓窗口（允许部分匹配，可与 --process 组合）");
+    println!("  --fullscreen         抓整块屏幕");
+    println!("  --list-windows       列出当前所有可见窗口后退出（用于确认真实的进程名/标题）");
+    println!();
+    println!("日志（控制台 + 日志文件双写）:");
+    println!(
+        "  日志目录固定为 ./{}，控制台只打印关键信息，日志文件记录全部细节",
+        LOG_DIR
+    );
+    println!("  -v, --verbose        控制台也输出每帧识别细节");
+}
+
+fn next_value<'a, I>(iter: &mut I, name: &str) -> Result<&'a str>
+where
+    I: Iterator<Item = &'a String>,
+{
+    iter.next()
+        .map(|value| value.as_str())
+        .ok_or_else(|| anyhow!("{} 缺少参数值", name))
 }
 
 fn parse_interval_ms(value: &str) -> Result<u64> {
@@ -444,6 +1223,179 @@ fn parse_interval_ms(value: &str) -> Result<u64> {
     Ok(parsed)
 }
 
+/// `--idle-timeout`：秒数，0 表示永不因空闲结束
+fn parse_idle_timeout(value: &str) -> Result<Option<Duration>> {
+    let parsed: u64 = value
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("--idle-timeout 需要非负整数秒，收到 '{}'", value))?;
+    if parsed == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(Duration::from_secs(parsed)))
+    }
+}
+
+/// 截屏来源：整块屏幕，或指定窗口的客户区
+enum CaptureSource {
+    Screen { screen: Screen },
+    Window(WindowCapture),
+}
+
+/// 指定窗口的截图状态；每帧重新定位，窗口移动/缩放都能跟上
+struct WindowCapture {
+    target: WindowInfo,
+    frame: Frame,
+}
+
+impl CaptureSource {
+    fn is_window(&self) -> bool {
+        matches!(self, CaptureSource::Window(_))
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            CaptureSource::Screen { screen } => format!(
+                "整屏 #{} {}x{}",
+                screen.display_info.id, screen.display_info.width, screen.display_info.height
+            ),
+            CaptureSource::Window(state) => format!(
+                "窗口 {}「{}」{}",
+                state.target.process,
+                state.target.title,
+                state.frame.describe()
+            ),
+        }
+    }
+
+    fn capture(&mut self) -> Result<screenshots::Image> {
+        match self {
+            CaptureSource::Screen { screen } => screen.capture(),
+            CaptureSource::Window(state) => state.capture(),
+        }
+    }
+}
+
+impl WindowCapture {
+    fn capture(&mut self) -> Result<screenshots::Image> {
+        let current = win_capture::locate(self.target.handle)
+            .ok_or_else(|| anyhow!("目标窗口已关闭: {}", self.target.describe()))?;
+
+        if current.minimized {
+            return Err(anyhow!(
+                "目标窗口已最小化；后台截图要求窗口处于非最小化状态: {}",
+                current.describe()
+            ));
+        }
+        if current.frame.is_empty() {
+            return Err(anyhow!(
+                "目标窗口客户区为空（可能被隐藏）: {}",
+                current.describe()
+            ));
+        }
+
+        if current.frame != self.frame {
+            self.frame = current.frame;
+            detail(
+                "窗口",
+                format!(
+                    "客户区变化 → {}（标题「{}」）",
+                    self.frame.describe(),
+                    current.title
+                ),
+            );
+        }
+
+        // 后台截图：窗口被其它窗口遮挡也能拿到真实内容，不改变窗口层级
+        win_capture::capture_client(self.target.handle)
+    }
+}
+
+/// 建立截屏来源：默认按进程抓窗口，`--fullscreen` 时抓整块屏幕
+fn open_capture_source(opts: &Options, screens: Vec<Screen>) -> Result<CaptureSource> {
+    if opts.fullscreen {
+        let screen = screens
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("没有找到屏幕"))?;
+        log(
+            "捕获",
+            format!(
+                "来源: 整屏 #{}（{}x{}）",
+                screen.display_info.id, screen.display_info.width, screen.display_info.height
+            ),
+        );
+        return Ok(CaptureSource::Screen { screen });
+    }
+
+    let target = win_capture::find(opts.process.as_deref(), opts.window.as_deref()).map_err(|e| {
+        let selector = match (&opts.process, &opts.window) {
+            (Some(process), Some(window)) => format!("进程 {} 且标题含「{}」", process, window),
+            (Some(process), None) => format!("进程 {}", process),
+            (None, Some(window)) => format!("标题含「{}」", window),
+            (None, None) => "未指定目标".to_string(),
+        };
+        anyhow!(
+            "没有找到匹配的窗口（{}）：{}。可用 --list-windows 查看所有可见窗口，或加 --fullscreen 抓整屏",
+            selector,
+            e
+        )
+    })?;
+    detail("窗口", format!("匹配到: {}", target.describe()));
+
+    if target.minimized {
+        return Err(anyhow!(
+            "目标窗口处于最小化状态，后台截图要求窗口非最小化，请先还原窗口: {}",
+            target.describe()
+        ));
+    }
+    if target.frame.is_empty() {
+        return Err(anyhow!(
+            "目标窗口客户区为空（可能被隐藏），无法截图: {}",
+            target.describe()
+        ));
+    }
+
+    log(
+        "捕获",
+        format!(
+            "来源: 进程 {}「{}」客户区 {}（后台截图，窗口在前台或后台都可以）",
+            target.process,
+            target.title,
+            target.frame.describe()
+        ),
+    );
+
+    Ok(CaptureSource::Window(WindowCapture {
+        target: target.clone(),
+        frame: target.frame,
+    }))
+}
+
+/// `--list-windows`：把可见窗口打到控制台和日志里
+fn list_windows_report() -> Result<()> {
+    let windows = win_capture::list_windows()?;
+    say(format!(
+        "共 {} 个可见窗口（按客户区面积排序）：",
+        windows.len()
+    ));
+    for window in &windows {
+        let line = format!(
+            "  {} | 进程 {} | 标题「{}」| 客户区 {}{}",
+            if window.minimized { "最小化" } else { "正常  " },
+            window.process,
+            window.title,
+            window.frame.describe(),
+            if !window.visible { " | 不可见" } else { "" }
+        );
+        println!("{}", line);
+        append_log_file(&line);
+    }
+    say("");
+    say("按进程抓: ./server --process <进程名>   按标题抓: ./server --window <标题片段>");
+    Ok(())
+}
+
 /// 截屏并批量检测同一帧内的所有二维码
 ///
 /// 发送端一屏最多展示 6 张二维码，这里必须把整帧内所有 grid 都解码出来，
@@ -451,7 +1403,8 @@ fn parse_interval_ms(value: &str) -> Result<u64> {
 fn detect_from_rgba(rgba: &[u8], width: usize, height: usize, verbose: bool) -> Result<Batch> {
     // 转换为灰度图像 (rqrr 需要灰度数据)
     let mut gray_data = vec![0u8; width * height];
-    for (gray, pixel) in gray_data.iter_mut().zip(rgba.chunks_exact(4)) {
+    let (pixels, _) = rgba.as_chunks::<4>();
+    for (gray, pixel) in gray_data.iter_mut().zip(pixels) {
         let r = pixel[0] as u32;
         let g = pixel[1] as u32;
         let b = pixel[2] as u32;
@@ -465,11 +1418,6 @@ fn detect_from_rgba(rgba: &[u8], width: usize, height: usize, verbose: bool) -> 
     Ok(detect_multi(gray_image, verbose))
 }
 
-/// 整图检测 + 分块检测，两路并行，取并集
-///
-/// - 整图检测：对 1/2/4/6 宫格的大二维码最有效；
-/// - 分块检测：小窗口下二维码排列紧凑时，rqrr 的定位图案分组会串味，
-///   切块后每块最多一两张码，可以把漏掉的补回来。
 /// 整图检测 + 分块检测，两路并行，取并集
 ///
 /// - 整图检测：对 1/2/4/6 宫格的大二维码最有效；
@@ -497,37 +1445,48 @@ fn detect_multi_inner(gray: GrayImage, verbose: bool, force_upscale: bool) -> Ba
         )
     });
 
-    let full_grids = full.grids;
-    let full_decoded = full.payloads.len();
+    let full_grids = full.full_grids;
+    let full_decoded = full.full_decoded;
+    let tile_grids = tiled.tile_grids;
+    let tile_decoded = tiled.tile_decoded;
 
     let mut payloads = full.payloads;
+    let mut extra = 0usize;
     for payload in tiled.payloads {
         if !payloads.contains(&payload) {
             payloads.push(payload);
+            extra += 1;
         }
     }
-
-    let mut grids = full.grids.max(tiled.grids);
-    let mut decode_failed = full.decode_failed + tiled.decode_failed;
 
     // 一张都没拿到，或"检测到网格却解不出"时，多半是二维码在屏幕上渲染得太小、
     // 模块边界落在非整数像素上。整数倍最近邻放大能把模块重新对齐，实测能把整屏救回来。
     let need_retry = payloads.is_empty() || full_decoded < full_grids;
-    if need_retry && (force_upscale || upscale_retry_allowed()) {
+    let retried = need_retry && (force_upscale || upscale_retry_allowed());
+    let mut retry_grids = 0usize;
+    let mut retry_decoded = 0usize;
+    if retried {
         let retry = detect_with_upscale(&retry_gray, verbose);
-        grids = grids.max(retry.grids);
-        decode_failed += retry.decode_failed;
+        retry_grids = retry.retry_grids;
+        retry_decoded = retry.retry_decoded;
         for payload in retry.payloads {
             if !payloads.contains(&payload) {
                 payloads.push(payload);
+                extra += 1;
             }
         }
     }
 
     Batch {
         payloads,
-        grids,
-        decode_failed,
+        full_grids,
+        full_decoded,
+        tile_grids,
+        tile_decoded,
+        retry_grids,
+        retry_decoded,
+        extra,
+        retried,
     }
 }
 
@@ -575,8 +1534,9 @@ fn detect_with_upscale(gray: &GrayImage, verbose: bool) -> Batch {
             imageops::FilterType::Nearest,
         );
         let batch = detect_from_gray(upscaled, verbose);
-        merged.grids = merged.grids.max(batch.grids);
-        merged.decode_failed += batch.decode_failed;
+        merged.retried = true;
+        merged.retry_grids = merged.retry_grids.max(batch.full_grids);
+        merged.retry_decoded = merged.retry_decoded.max(batch.full_decoded);
 
         for payload in batch.payloads {
             if !merged.payloads.contains(&payload) {
@@ -585,13 +1545,14 @@ fn detect_with_upscale(gray: &GrayImage, verbose: bool) -> Batch {
         }
 
         if !merged.payloads.is_empty() {
-            if verbose {
-                println!(
-                    "[调试] 放大 {} 倍后识别出 {} 张二维码",
+            detail(
+                "调试",
+                format!(
+                    "放大 {} 倍后识别出 {} 张二维码",
                     factor,
                     merged.payloads.len()
-                );
-            }
+                ),
+            );
             break;
         }
     }
@@ -618,7 +1579,7 @@ fn detect_from_gray(gray_image: GrayImage, verbose: bool) -> Batch {
 /// 从灰度图中批量识别所有二维码（内部实现）
 ///
 /// 单张码解码（version 40 约 20ms）按网格分片并行，6 张码可压到 1 张的时间。
-fn detect_from_gray_inner(gray_image: GrayImage, verbose: bool) -> Batch {
+fn detect_from_gray_inner(gray_image: GrayImage, _verbose: bool) -> Batch {
     // 准备图像用于检测
     let mut prepared = rqrr::PreparedImage::prepare(gray_image);
 
@@ -629,7 +1590,7 @@ fn detect_from_gray_inner(gray_image: GrayImage, verbose: bool) -> Batch {
     let threads = worker_threads().min(grid_count).max(1);
     let per = grid_count.div_ceil(threads).max(1);
 
-    let parts: Vec<(Vec<String>, usize)> = thread::scope(|scope| {
+    let parts: Vec<Vec<String>> = thread::scope(|scope| {
         let mut handles = Vec::new();
         let mut start = 0usize;
 
@@ -639,15 +1600,15 @@ fn detect_from_gray_inner(gray_image: GrayImage, verbose: bool) -> Batch {
 
             handles.push(scope.spawn(move || {
                 let mut payloads = Vec::new();
-                let mut failed = 0usize;
                 for grid in slice {
-                    // 单张码解码失败（含 rqrr 内部断言 panic）只算失败，不影响同屏其它码
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| grid.decode())) {
-                        Ok(Ok((_metadata, payload))) => payloads.push(payload),
-                        _ => failed += 1,
+                    // 单张码解码失败（含 rqrr 内部断言 panic）只跳过，不影响同屏其它码
+                    if let Ok(Ok((_metadata, payload))) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| grid.decode()))
+                    {
+                        payloads.push(payload);
                     }
                 }
-                (payloads, failed)
+                payloads
             }));
 
             start = end;
@@ -660,24 +1621,16 @@ fn detect_from_gray_inner(gray_image: GrayImage, verbose: bool) -> Batch {
     });
 
     let mut payloads = Vec::with_capacity(grid_count);
-    let mut decode_failed = 0usize;
-    for (part, failed) in parts {
+    for part in parts {
         payloads.extend(part);
-        decode_failed += failed;
     }
 
-    if verbose && grid_count > 0 {
-        println!(
-            "[调试] 检测到 {} 个二维码网格，解码成功 {} 个",
-            grid_count,
-            payloads.len()
-        );
-    }
-
+    let decoded = payloads.len();
     Batch {
         payloads,
-        grids: grid_count,
-        decode_failed,
+        full_grids: grid_count,
+        full_decoded: decoded,
+        ..Batch::empty()
     }
 }
 
@@ -730,12 +1683,12 @@ fn detect_tiles(gray: &GrayImage, cols: u32, rows: u32, overlap: f32, verbose: b
     });
 
     let mut payloads: Vec<String> = Vec::new();
-    let mut grids = 0usize;
-    let mut decode_failed = 0usize;
+    let mut tile_grids = 0usize;
+    let mut tile_decoded = 0usize;
 
     for part in parts {
-        grids += part.grids;
-        decode_failed += part.decode_failed;
+        tile_grids += part.full_grids;
+        tile_decoded += part.full_decoded;
         for payload in part.payloads {
             if !payloads.contains(&payload) {
                 payloads.push(payload);
@@ -745,8 +1698,9 @@ fn detect_tiles(gray: &GrayImage, cols: u32, rows: u32, overlap: f32, verbose: b
 
     Batch {
         payloads,
-        grids,
-        decode_failed,
+        tile_grids,
+        tile_decoded,
+        ..Batch::empty()
     }
 }
 
@@ -774,8 +1728,10 @@ fn process_payloads(
                     _ => {}
                 }
 
-                if !received_chunks.contains_key(&seq) {
-                    received_chunks.insert(seq, chunk);
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    received_chunks.entry(seq)
+                {
+                    entry.insert(chunk);
                     new_seqs.push(seq);
                 }
             }
@@ -837,14 +1793,14 @@ fn restore_file(chunks: &HashMap<usize, Chunk>, expected_total: Option<usize>) -
     // 检查是否有缺失的片段
     if let Some(total) = expected_total {
         if received_count < total {
-            println!();
-            println!("╔════════════════════════════════════════╗");
-            println!("║           警告：片段缺失!             ║");
-            println!("╠════════════════════════════════════════╣");
-            println!("║  预期片段数: {:26} ║", total);
-            println!("║  实际接收数: {:26} ║", received_count);
-            println!("╚════════════════════════════════════════╝");
-            println!();
+            say("");
+            say("╔════════════════════════════════════════╗");
+            say("║           警告：片段缺失!             ║");
+            say("╠════════════════════════════════════════╣");
+            say(format!("║  预期片段数: {:26} ║", total));
+            say(format!("║  实际接收数: {:26} ║", received_count));
+            say("╚════════════════════════════════════════╝");
+            say("");
 
             // 列出缺失的片段
             let mut missing: Vec<usize> = Vec::new();
@@ -855,11 +1811,11 @@ fn restore_file(chunks: &HashMap<usize, Chunk>, expected_total: Option<usize>) -
             }
 
             if missing.len() <= 20 {
-                println!("缺失的片段: {:?}", missing);
+                say(format!("缺失的片段: {:?}", missing));
             } else {
-                println!("缺失的片段: {} 个 (太多无法列出)", missing.len());
+                say(format!("缺失的片段: {} 个 (太多无法列出)", missing.len()));
             }
-            println!();
+            say("");
 
             return Err(anyhow!(
                 "接收不完整: 缺失 {}/{} 片段，请重新扫描",
@@ -876,8 +1832,11 @@ fn restore_file(chunks: &HashMap<usize, Chunk>, expected_total: Option<usize>) -
         }
     }
 
-    println!();
-    println!("按序号排序并拼接 {} 个数据片段...", received_count);
+    say("");
+    log(
+        "重组",
+        format!("按序号排序并拼接 {} 个数据片段", received_count),
+    );
 
     // 按序号排序并拼接数据
     let mut sorted_chunks: Vec<&Chunk> = chunks.values().collect();
@@ -889,15 +1848,15 @@ fn restore_file(chunks: &HashMap<usize, Chunk>, expected_total: Option<usize>) -
         .collect::<Vec<&str>>()
         .join("");
 
-    println!("Base64 数据总长度: {} bytes", combined.len());
+    detail("重组", format!("Base64 数据总长度: {} bytes", combined.len()));
 
     // Base64 解码
-    println!("解码 Base64...");
+    log("重组", "解码 Base64...");
     let file_data = base64::engine::general_purpose::STANDARD
         .decode(combined.trim())
         .map_err(|e| anyhow!("Base64 解码失败: {}", e))?;
 
-    println!("解码后文件大小: {} bytes", file_data.len());
+    detail("重组", format!("解码后文件大小: {} bytes", file_data.len()));
 
     // 生成输出文件名
     let output_filename = generate_output_filename();
@@ -907,14 +1866,18 @@ fn restore_file(chunks: &HashMap<usize, Chunk>, expected_total: Option<usize>) -
     file.write_all(&file_data)
         .map_err(|e| anyhow!("写入文件失败: {}", e))?;
 
-    println!();
-    println!("╔════════════════════════════════════════╗");
-    println!("║           文件接收成功!                ║");
-    println!("╠════════════════════════════════════════╣");
-    println!("║  文件名: {:30} ║", output_filename);
-    println!("║  大小:   {:30} ║", format_file_size(file_data.len()));
-    println!("║  片段数: {:30} ║", received_count);
-    println!("╚════════════════════════════════════════╝");
+    say("");
+    log("完成", "文件已重组成功");
+    say("╔════════════════════════════════════════╗");
+    say("║           文件接收成功!                ║");
+    say("╠════════════════════════════════════════╣");
+    say(format!("║  文件名: {:30} ║", output_filename));
+    say(format!(
+        "║  大小:   {:30} ║",
+        format_file_size(file_data.len())
+    ));
+    say(format!("║  片段数: {:30} ║", received_count));
+    say("╚════════════════════════════════════════╝");
 
     Ok(())
 }
@@ -1148,6 +2111,44 @@ mod tests {
     }
 
     #[test]
+    fn missing_list_preview_truncates() {
+        assert_eq!(summarize_missing(&[]), "[]");
+        assert_eq!(summarize_missing(&[2, 4, 6]), "[2,4,6]");
+
+        // 正好 20 个：完整列出，不带省略号
+        let exact: Vec<usize> = (1..=20).collect();
+        let summary = summarize_missing(&exact);
+        assert!(summary.ends_with("20]"), "20 个应完整列出: {}", summary);
+
+        // 超过 20 个：只列前 20，并以省略号结尾（总数由调用方打印）
+        let long: Vec<usize> = (1..=25).collect();
+        let summary = summarize_missing(&long);
+        assert!(summary.contains("20,"), "应包含第 20 个: {}", summary);
+        assert!(!summary.contains("21,"), "不应列出第 21 个: {}", summary);
+        assert!(summary.ends_with("…]"), "超过 20 个应有省略号: {}", summary);
+    }
+
+    #[test]
+    fn find_missing_chunks_reports_gaps() {
+        let mut chunks: HashMap<usize, Chunk> = HashMap::new();
+        for seq in [1usize, 3, 5] {
+            chunks.insert(
+                seq,
+                Chunk {
+                    seq,
+                    total: 5,
+                    data: "x".to_string(),
+                },
+            );
+        }
+        assert_eq!(find_missing_chunks(&chunks, 5), vec![2, 4]);
+
+        // 一个片段都没有时，缺失的就是整个 1..=total
+        let empty: HashMap<usize, Chunk> = HashMap::new();
+        assert_eq!(find_missing_chunks(&empty, 3), vec![1, 2, 3]);
+    }
+
+    #[test]
     fn parse_options_reads_flags() {
         let args: Vec<String> = ["server", "--resume", "--verbose", "--interval-ms", "20"]
             .iter()
@@ -1167,6 +2168,78 @@ mod tests {
 
         // 非法间隔
         let args: Vec<String> = ["server", "--interval-ms", "0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_options(&args).is_err());
+    }
+
+    #[test]
+    fn parse_options_reads_window_and_timeout() {
+        let args: Vec<String> = [
+            "server",
+            "--process",
+            "HSR",
+            "--window=liushikai",
+            "--idle-timeout",
+            "0",
+            "--fullscreen",
+            "--process=chrome",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // --fullscreen 与 --process 同时给 = 参数冲突
+        assert!(parse_options(&args).is_err());
+
+        let args: Vec<String> = ["server", "--process", "HSR", "--window=liushikai"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let opts = parse_options(&args).expect("解析失败");
+        assert_eq!(opts.process.as_deref(), Some("HSR"));
+        assert_eq!(opts.window.as_deref(), Some("liushikai"));
+
+        // 默认按进程 HSR 抓窗口
+        let args: Vec<String> = vec!["server".to_string()];
+        let opts = parse_options(&args).expect("解析失败");
+        assert_eq!(opts.process.as_deref(), Some(DEFAULT_PROCESS));
+        assert!(!opts.fullscreen);
+
+        // --fullscreen 退回整屏
+        let args: Vec<String> = ["server", "--fullscreen"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let opts = parse_options(&args).expect("解析失败");
+        assert!(opts.fullscreen);
+        assert!(opts.process.is_none());
+        assert!(opts.window.is_none());
+
+        let args: Vec<String> = ["server", "--idle-timeout", "0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let opts = parse_options(&args).expect("解析失败");
+        // 0 表示永不超时
+        assert!(opts.idle_timeout.is_none());
+
+        let args: Vec<String> = ["server", "--idle-timeout=30"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let opts = parse_options(&args).expect("解析失败");
+        assert_eq!(opts.idle_timeout, Some(Duration::from_secs(30)));
+
+        // 非数字的时长必须报错，而不是被静默忽略
+        let args: Vec<String> = ["server", "--idle-timeout", "abc"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_options(&args).is_err());
+
+        // 空的进程名/标题没有意义
+        let args: Vec<String> = ["server", "--process="]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -1516,7 +2589,7 @@ mod tests {
 
         let batch = detect_from_gray(canvas, false);
 
-        assert_eq!(batch.grids, 1);
+        assert_eq!(batch.full_grids, 1);
         assert_eq!(batch.payloads, vec!["1/1|ONLY".to_string()]);
     }
 }

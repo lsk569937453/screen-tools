@@ -15,3 +15,15 @@ serde_json = "1.0"
 [dev-dependencies]
 # 仅测试用：在内存中渲染二维码，合成"一屏多码"的图像来验证批量识别
 qrcode = "0.14"
+
+[target.'cfg(windows)'.dependencies]
+# 按进程名/标题定位窗口（EnumWindows 等），并开启 DPI 感知保证窗口坐标与截图像素一致
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+] }

@@ -15,3 +15,7 @@ server/received_file_*
 # 发送端生成的二维码与本地调试临时目录
 qr_output/
 tmp-qr/
+
+# 接收端日志（logs/server-<时间戳>.log）
+logs/
+server/logs/

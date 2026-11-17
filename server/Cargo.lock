@@ -1138,6 +1138,7 @@ dependencies = [
  "screenshots",
  "serde",
  "serde_json",
+ "windows-sys",
 ]
 
 [[package]]
