@@ -1,3 +1,11 @@
 target
 .claude
 .qr_session.json
+
+# 接收端落盘的产物：收到的文件与解压出来的目录
+received_file_*
+server/received_file_*
+
+# 发送端生成的二维码与本地调试临时目录
+qr_output/
+tmp-qr/
