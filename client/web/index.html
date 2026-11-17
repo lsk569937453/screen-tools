@@ -19,91 +19,167 @@
                 flex-direction: column;
                 align-items: center;
                 justify-content: center;
-                padding: 20px;
+                padding: 16px;
+            }
+
+            /* 播放模式：去掉一切装饰，把屏幕全部让给二维码 */
+            body.playing {
+                padding: 0;
+                background: #0f172a;
+                justify-content: stretch;
             }
 
             .container {
                 background: white;
                 border-radius: 20px;
                 box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-                padding: 40px;
-                max-width: 600px;
+                padding: 18px;
+                max-width: 1100px;
                 width: 100%;
+                /* 撑满可视高度并靠 flex 分配，避免内容把按钮挤出屏幕 */
+                height: calc(100vh - 32px);
+                display: flex;
+                flex-direction: column;
                 text-align: center;
             }
 
+            body.playing .container {
+                max-width: none;
+                width: 100vw;
+                height: 100vh;
+                border-radius: 0;
+                padding: 8px;
+                box-shadow: none;
+            }
+
             .header {
+                flex: 0 0 auto;
                 border: 3px solid #1e3c72;
                 border-radius: 10px;
-                padding: 20px;
-                margin-bottom: 30px;
+                padding: 12px;
+                margin-bottom: 8px;
                 background: #f8f9fa;
             }
 
             .header h1 {
                 color: #1e3c72;
-                font-size: 24px;
-                margin-bottom: 10px;
+                font-size: 20px;
+                margin-bottom: 6px;
             }
 
             .stats {
                 display: flex;
                 justify-content: space-around;
-                margin-top: 15px;
+                margin-top: 6px;
                 color: #555;
-                font-size: 14px;
+                font-size: 13px;
+                gap: 8px;
             }
 
             .stat-item {
                 display: flex;
                 flex-direction: column;
-                gap: 5px;
+                gap: 4px;
+                min-width: 72px;
             }
 
             .stat-value {
-                font-size: 24px;
+                font-size: 20px;
                 font-weight: bold;
                 color: #1e3c72;
             }
 
-            .qr-container {
-                position: relative;
+            /* 二维码宫格：最多 6 张，行列由 --cols/--rows 控制 */
+            .qr-grid {
+                --cols: 3;
+                --rows: 2;
+                display: grid;
+                /* 用 minmax(0, 1fr) 而不是 1fr：1fr 的下限是 auto，
+                   内容（二维码）会把行撑破，压到下面的控件上 */
+                grid-template-columns: repeat(var(--cols), minmax(0, 1fr));
+                grid-template-rows: repeat(var(--rows), minmax(0, 1fr));
+                gap: 8px;
                 width: 100%;
-                max-width: 400px;
-                margin: 0 auto 30px;
+                flex: 1 1 auto;
+                min-height: 0;
+                overflow: hidden;
+                margin: 8px 0;
             }
 
-            .qr-image {
-                width: 100%;
-                height: auto;
-                border: 4px solid #1e3c72;
-                border-radius: 10px;
-                background: white;
-                transition: transform 0.3s ease;
+            body.playing .qr-grid {
+                margin: 0;
+                gap: 6px;
+                /* 播放时隐藏鼠标指针：指针压在二维码上会直接让那一张解不出来 */
+                cursor: none;
             }
 
-            .qr-image:hover {
-                transform: scale(1.02);
+            body.playing .qr-slot {
+                cursor: none;
+            }
+
+            .qr-slot {
+                width: 100%;
+                height: 100%;
+                object-fit: contain;
+                background: #ffffff;
+                border-radius: 4px;
+                display: none;
+            }
+
+            /* 高亮描边画在图片外侧，绝不遮挡二维码模块 */
+            .qr-slot.focused {
+                outline: 4px solid #f59e0b;
+                outline-offset: 2px;
             }
 
             .data-preview {
+                flex: 0 0 auto;
                 background: #f8f9fa;
                 border: 2px solid #dee2e6;
                 border-radius: 8px;
-                padding: 15px;
-                margin-top: 20px;
+                padding: 10px;
+                margin-top: 8px;
                 font-size: 12px;
                 color: #666;
                 word-break: break-all;
-                max-height: 100px;
+                max-height: 64px;
                 overflow-y: auto;
             }
 
+            /* 出错时把提示区域撑开，避免关键信息被 max-height 截断 */
+            .data-preview.expanded {
+                flex: 1 1 auto;
+                max-height: none;
+                overflow: visible;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: #fff5f5;
+                border-color: #f5c6cb;
+            }
+
+            /* 没有二维码时不显示空宫格，把空间留给提示 */
+            .qr-grid.empty {
+                display: none;
+            }
+
             .controls {
+                flex: 0 0 auto;
                 display: flex;
                 gap: 10px;
-                margin-top: 20px;
+                margin-top: 10px;
                 justify-content: center;
+                flex-wrap: wrap;
+            }
+
+            body.playing .controls {
+                margin-top: 6px;
+                flex: 0 0 auto;
+            }
+
+            body.playing .controls button {
+                padding: 6px 14px;
+                font-size: 13px;
             }
 
             button {
@@ -116,12 +192,17 @@
                 font-family: inherit;
             }
 
+            button:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+            }
+
             .btn-primary {
                 background: #1e3c72;
                 color: white;
             }
 
-            .btn-primary:hover {
+            .btn-primary:hover:not(:disabled) {
                 background: #2a5298;
                 transform: translateY(-2px);
                 box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
@@ -132,16 +213,42 @@
                 color: white;
             }
 
-            .btn-secondary:hover {
+            .btn-secondary:hover:not(:disabled) {
                 background: #5a6268;
             }
 
+            /* 按钮显隐完全由 body.playing 驱动 */
+            #play-pause,
+            #restart,
+            #exit-play {
+                display: none;
+            }
+
+            body.playing #start-play {
+                display: none;
+            }
+
+            body.playing #play-pause,
+            body.playing #restart,
+            body.playing #exit-play {
+                display: inline-block;
+            }
+
+            body.playing .header,
+            body.playing .data-preview,
+            body.playing .progress,
+            body.playing .jump-control {
+                display: none;
+            }
+
             .jump-control {
+                flex: 0 0 auto;
                 display: flex;
                 align-items: center;
                 gap: 10px;
-                margin-top: 15px;
+                margin-top: 10px;
                 justify-content: center;
+                flex-wrap: wrap;
             }
 
             .jump-input {
@@ -154,18 +261,53 @@
                 font-family: inherit;
             }
 
-            .jump-input:focus {
+            .jump-input:focus,
+            .page-size-select:focus {
                 outline: none;
                 border-color: #2a5298;
                 box-shadow: 0 0 0 3px rgba(30, 60, 114, 0.1);
             }
 
+            .page-size-select {
+                padding: 8px 12px;
+                font-size: 15px;
+                border: 2px solid #1e3c72;
+                border-radius: 8px;
+                font-family: inherit;
+                background: #fff;
+                cursor: pointer;
+            }
+
+            .hint {
+                width: 100%;
+                font-size: 12px;
+                color: #888;
+                margin-top: 4px;
+            }
+
+            .loop-toggle {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                font-size: 14px;
+                color: #444;
+                cursor: pointer;
+                user-select: none;
+            }
+
+            .loop-toggle input {
+                width: 16px;
+                height: 16px;
+                cursor: pointer;
+            }
+
             .progress {
+                flex: 0 0 auto;
                 width: 100%;
                 height: 6px;
                 background: #e9ecef;
                 border-radius: 3px;
-                margin-top: 20px;
+                margin-top: 10px;
                 overflow: hidden;
             }
 
@@ -207,11 +349,15 @@
                 <div class="stats">
                     <div class="stat-item">
                         <span class="stat-value" id="current">-</span>
-                        <span>当前</span>
+                        <span>当前片段</span>
                     </div>
                     <div class="stat-item">
                         <span class="stat-value" id="total">-</span>
                         <span>总数</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-value" id="page">-</span>
+                        <span>页码</span>
                     </div>
                     <div class="stat-item">
                         <span class="stat-value" id="status">⏳</span>
@@ -220,15 +366,8 @@
                 </div>
             </div>
 
-            <div class="qr-container">
-                <img
-                    id="qr-image"
-                    class="qr-image"
-                    src=""
-                    alt="QR Code"
-                    style="display: none"
-                />
-            </div>
+            <!-- 最多 6 个槽位，由脚本按每屏张数显示/隐藏 -->
+            <div class="qr-grid" id="qr-grid"></div>
 
             <div class="data-preview" id="data-preview">加载中...</div>
 
@@ -249,17 +388,22 @@
                 >
                     开始播放
                 </button>
-                <button
-                    class="btn-primary"
-                    id="play-pause"
-                    onclick="togglePlay()"
-                    style="display: none"
-                >
+                <button class="btn-primary" id="play-pause" onclick="togglePlay()">
                     暂停
                 </button>
-                <button class="btn-secondary" onclick="restart()" disabled>
+                <button class="btn-secondary" id="restart" onclick="restart()">
                     重新开始
                 </button>
+                <button class="btn-secondary" id="exit-play" onclick="exitPlayMode()">
+                    退出播放
+                </button>
+                <button class="btn-secondary" id="fullscreen" onclick="toggleFullscreen()">
+                    全屏
+                </button>
+                <label class="loop-toggle" for="loop-play">
+                    <input type="checkbox" id="loop-play" />
+                    循环播放
+                </label>
             </div>
 
             <div class="jump-control">
@@ -274,30 +418,128 @@
                     onkeypress="handleJumpKeypress(event)"
                 />
                 <button class="btn-primary" onclick="jumpToQr()">跳转</button>
+
+                <label for="per-page">每屏张数:</label>
+                <select id="per-page" class="page-size-select">
+                    <option value="1">1 张</option>
+                    <option value="2">2 张</option>
+                    <option value="3">3 张</option>
+                    <option value="4">4 张</option>
+                    <option value="6" selected>6 张</option>
+                </select>
+                <span class="hint">
+                    每屏张数越多传输越快，但单个二维码越小、越难识别；16:9
+                    屏幕建议 6 张（3×2）或 4 张（2×2）。
+                </span>
             </div>
         </div>
 
         <script>
-            const SLIDE_INTERVAL_MS = 300;
+            const SLIDE_INTERVAL_MS = 300; // 每屏停留时间（毫秒）
+            const MAX_PER_PAGE = 6; // 单屏最多展示 6 张
+            // 每屏张数 -> [列, 行]
+            const GRID_PRESETS = {
+                1: [1, 1],
+                2: [2, 1],
+                3: [3, 1],
+                4: [2, 2],
+                6: [3, 2],
+            };
+
             let totalQr = 0;
-            let currentIndex = 0;
+            let perPage = 6;
+            let pageIndex = 0;
             let isPlaying = false;
             let interval = null;
             let hasStarted = false;
+            let focusSeq = null;
 
-            const qrImage = document.getElementById("qr-image");
+            const qrGrid = document.getElementById("qr-grid");
             const currentSpan = document.getElementById("current");
             const totalSpan = document.getElementById("total");
+            const pageSpan = document.getElementById("page");
             const statusSpan = document.getElementById("status");
             const statusText = document.getElementById("status-text");
             const progressBar = document.getElementById("progress-bar");
             const startPlayBtn = document.getElementById("start-play");
             const playPauseBtn = document.getElementById("play-pause");
-            const restartBtn = document.querySelector(".btn-secondary");
             const dataPreview = document.getElementById("data-preview");
+            const perPageSelect = document.getElementById("per-page");
+
+            // 预创建 6 个槽位
+            const slots = [];
+            for (let i = 0; i < MAX_PER_PAGE; i++) {
+                const img = document.createElement("img");
+                img.className = "qr-slot";
+                img.alt = "QR Code";
+                qrGrid.appendChild(img);
+                slots.push(img);
+            }
+
+            function pad3(n) {
+                return String(n).padStart(3, "0");
+            }
+
+            function qrUrl(seq) {
+                return `qr_output/qr_${pad3(seq)}.svg`;
+            }
+
+            function pageCount() {
+                return Math.max(1, Math.ceil(totalQr / perPage));
+            }
+
+            function pageStart(page) {
+                return page * perPage;
+            }
+
+            function applyGridPreset() {
+                const [cols, rows] = GRID_PRESETS[perPage] || GRID_PRESETS[6];
+                qrGrid.style.setProperty("--cols", cols);
+                qrGrid.style.setProperty("--rows", rows);
+            }
+
+            // 渲染当前屏：显示 start+1 .. end 片段
+            function updateDisplay() {
+                const start = pageStart(pageIndex);
+                const end = Math.min(start + perPage, totalQr);
+
+                slots.forEach((slot, i) => {
+                    const seq = start + i + 1;
+                    if (seq <= end) {
+                        const url = qrUrl(seq);
+                        if (slot.getAttribute("src") !== url) {
+                            slot.src = url;
+                        }
+                        slot.style.display = "block";
+                        slot.classList.toggle("focused", focusSeq === seq);
+                    } else {
+                        slot.style.display = "none";
+                        slot.classList.remove("focused");
+                    }
+                });
+
+                const shown = Math.max(0, end - start);
+                currentSpan.textContent = shown > 0 ? `${start + 1}–${end}` : "-";
+                totalSpan.textContent = totalQr;
+                pageSpan.textContent = `${pageIndex + 1}/${pageCount()}`;
+                progressBar.style.width = `${totalQr ? (end / totalQr) * 100 : 0}%`;
+                dataPreview.textContent =
+                    shown > 0
+                        ? `本屏 ${shown} 张: qr_${pad3(start + 1)}.svg … qr_${pad3(end)}.svg`
+                        : "没有可显示的二维码";
+            }
 
             // 从 API 获取二维码信息
             async function loadQrInfo() {
+                // 直接双击打开 index.html（file://）时没有后端，直接给提示
+                if (window.location.protocol === "file:") {
+                    showError(
+                        "请不要直接打开 html 文件。先运行 client（不带参数）启动服务，" +
+                            "再访问 http://localhost:9090/"
+                    );
+                    return;
+                }
+
                 try {
                     const response = await fetch("/api/info");
                     const data = await response.json();
@@ -312,16 +554,33 @@
                     document.getElementById("jump-input").max = totalQr;
 
                     if (totalQr === 0) {
-                        showError("未找到二维码文件，请先使用命令行生成二维码");
+                        showError(
+                            "未找到二维码文件，请先执行 <code>client &lt;文件路径&gt;</code> 生成。" +
+                                `<br>服务正在查找目录：<code>${data.dir || "qr_output"}</code>` +
+                                "<br>（该目录相对于启动 client 时的工作目录）"
+                        );
                         return;
                     }
 
                     // 准备就绪，等待用户点击开始播放
-                    currentIndex = 0;
+                    qrGrid.classList.remove("empty");
+                    dataPreview.classList.remove("expanded");
+                    pageIndex = 0;
+                    focusSeq = null;
+                    perPage = Math.min(
+                        parseInt(perPageSelect.value, 10) || MAX_PER_PAGE,
+                        MAX_PER_PAGE
+                    );
+                    applyGridPreset();
                     updateDisplay();
                     statusSpan.textContent = "▶️";
                     statusText.textContent = "准备就绪";
                     startPlayBtn.disabled = false;
+
+                    // 支持 http://localhost:9090/?autoplay=1 打开即自动播放（kiosk 场景）
+                    if (new URLSearchParams(window.location.search).has("autoplay")) {
+                        startPlayClick();
+                    }
                 } catch (error) {
                     showError("无法连接到服务器");
                     console.error(error);
@@ -331,35 +590,35 @@
             // 点击开始播放按钮
             function startPlayClick() {
                 hasStarted = true;
-                startPlayBtn.style.display = "none";
-                playPauseBtn.style.display = "inline-block";
-                restartBtn.disabled = false;
+                pageIndex = 0;
+                focusSeq = null;
+                document.body.classList.add("playing");
+                updateDisplay();
                 startPlay();
             }
 
-            function updateDisplay() {
-                const filename = `qr_output/qr_${String(currentIndex + 1).padStart(3, "0")}.svg`;
-                qrImage.src = filename;
-                qrImage.style.display = "block";
-                currentSpan.textContent = currentIndex + 1;
-                progressBar.style.width = `${((currentIndex + 1) / totalQr) * 100}%`;
-                dataPreview.textContent = `文件: qr_${String(currentIndex + 1).padStart(3, "0")}.svg`;
-            }
-
-            function nextQr() {
-                // 播放到最后一个QR码时自动暂停
-                if (currentIndex + 1 >= totalQr) {
+            function nextPage() {
+                // 播放到最后一屏：循环播放则回到第一屏，否则自动暂停
+                if (pageIndex + 1 >= pageCount()) {
+                    if (document.getElementById("loop-play").checked) {
+                        pageIndex = 0;
+                        focusSeq = null;
+                        updateDisplay();
+                        return;
+                    }
                     stopPlay();
                     statusSpan.textContent = "✅";
                     statusText.textContent = "播放完毕";
                     return;
                 }
-                currentIndex = currentIndex + 1;
+                pageIndex += 1;
+                focusSeq = null;
                 updateDisplay();
             }
 
             function startPlay() {
-                interval = setInterval(nextQr, SLIDE_INTERVAL_MS);
+                clearInterval(interval);
+                interval = setInterval(nextPage, SLIDE_INTERVAL_MS);
                 isPlaying = true;
                 statusSpan.textContent = "▶";
                 statusText.textContent = "播放中";
@@ -369,6 +628,7 @@
 
             function stopPlay() {
                 clearInterval(interval);
+                interval = null;
                 isPlaying = false;
                 statusSpan.textContent = "⏸";
                 statusText.textContent = "已暂停";
@@ -385,32 +645,56 @@
             }
 
             function restart() {
-                currentIndex = 0;
+                pageIndex = 0;
+                focusSeq = null;
                 updateDisplay();
-                if (!isPlaying && hasStarted) {
+                if (!isPlaying) {
                     startPlay();
+                }
+            }
+
+            function exitPlayMode() {
+                stopPlay();
+                document.body.classList.remove("playing");
+                hasStarted = false;
+                pageIndex = 0;
+                focusSeq = null;
+                updateDisplay();
+                statusSpan.textContent = "▶️";
+                statusText.textContent = "准备就绪";
+            }
+
+            function toggleFullscreen() {
+                if (!document.fullscreenElement) {
+                    const request = document.documentElement.requestFullscreen;
+                    if (request) {
+                        document.documentElement.requestFullscreen().catch(() => {});
+                    }
+                } else if (document.exitFullscreen) {
+                    document.exitFullscreen().catch(() => {});
                 }
             }
 
             function jumpToQr() {
                 const input = document.getElementById("jump-input");
-                const targetIndex = parseInt(input.value) - 1; // 转换为0-based索引
+                const target = parseInt(input.value, 10);
 
-                if (isNaN(targetIndex) || targetIndex < 0 || targetIndex >= totalQr) {
+                if (isNaN(target) || target < 1 || target > totalQr) {
                     alert(`请输入有效的片段号 (1-${totalQr})`);
                     return;
                 }
 
-                currentIndex = targetIndex;
+                // 跳到包含该片段的屏，并高亮它
+                focusSeq = target;
+                pageIndex = Math.floor((target - 1) / perPage);
                 updateDisplay();
 
-                // 如果正在播放，继续播放；如果暂停，保持暂停
                 if (!isPlaying && hasStarted) {
                     statusSpan.textContent = "⏸";
-                    statusText.textContent = `已跳转到第 ${targetIndex + 1} 片段`;
+                    statusText.textContent = `已跳转到第 ${target} 片段`;
                 } else if (isPlaying) {
                     statusSpan.textContent = "▶";
-                    statusText.textContent = `播放中 (第 ${targetIndex + 1} 片段)`;
+                    statusText.textContent = `播放中 (第 ${target} 片段)`;
                 }
 
                 input.value = ""; // 清空输入框
@@ -422,10 +706,55 @@
                 }
             }
 
+            // 切换每屏张数时保持当前屏首片段仍在屏上
+            perPageSelect.addEventListener("change", () => {
+                const anchor = pageStart(pageIndex) + 1;
+                perPage = Math.min(
+                    parseInt(perPageSelect.value, 10) || MAX_PER_PAGE,
+                    MAX_PER_PAGE
+                );
+                pageIndex = Math.floor((anchor - 1) / perPage);
+                applyGridPreset();
+                updateDisplay();
+            });
+
+            // 空格播放/暂停，左右方向键翻屏，Esc 退出播放模式
+            document.addEventListener("keydown", (event) => {
+                const tag = event.target.tagName;
+                if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") {
+                    return;
+                }
+                if (event.key === "Escape" && document.body.classList.contains("playing")) {
+                    exitPlayMode();
+                    return;
+                }
+                if (!hasStarted) {
+                    return;
+                }
+                if (event.code === "Space") {
+                    event.preventDefault();
+                    togglePlay();
+                } else if (event.key === "ArrowRight") {
+                    event.preventDefault();
+                    stopPlay();
+                    nextPage();
+                } else if (event.key === "ArrowLeft") {
+                    event.preventDefault();
+                    stopPlay();
+                    if (pageIndex > 0) {
+                        pageIndex -= 1;
+                        focusSeq = null;
+                        updateDisplay();
+                    }
+                }
+            });
+
             function showError(message) {
                 statusSpan.textContent = "❌";
                 statusText.textContent = "错误";
                 statusText.className = "";
+                qrGrid.classList.add("empty");
+                dataPreview.classList.add("expanded");
                 dataPreview.innerHTML = `<div class="error">${message}</div>`;
                 progressBar.style.width = "0%";
             }
