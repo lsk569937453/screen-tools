@@ -1398,8 +1398,8 @@ fn list_windows_report() -> Result<()> {
 
 /// 截屏并批量检测同一帧内的所有二维码
 ///
-/// 发送端一屏最多展示 6 张二维码，这里必须把整帧内所有 grid 都解码出来，
-/// 单张失败不影响同一帧的其它二维码。
+/// 发送端一屏可同时展示多张二维码（张数由前端按窗口尺寸自适应），
+/// 这里必须把整帧内所有 grid 都解码出来，单张失败不影响同一帧的其它二维码。
 fn detect_from_rgba(rgba: &[u8], width: usize, height: usize, verbose: bool) -> Result<Batch> {
     // 转换为灰度图像 (rqrr 需要灰度数据)
     let mut gray_data = vec![0u8; width * height];
@@ -1418,13 +1418,15 @@ fn detect_from_rgba(rgba: &[u8], width: usize, height: usize, verbose: bool) -> 
     Ok(detect_multi(gray_image, verbose))
 }
 
-/// 整图检测 + 分块检测，两路并行，取并集
+/// 整图检测 + 分块检测，多路并行，取并集
 ///
 /// - 整图检测：对 1/2/4/6 宫格的大二维码最有效；
-/// - 分块检测：小窗口下二维码排列紧凑时，rqrr 的定位图案分组会串味，
-///   切块后每块最多一两张码，可以把漏掉的补回来。
+/// - 3×2 分块：小窗口下二维码排列紧凑时，rqrr 的定位图案分组会串味，
+///   切块后每块最多一两张码，可以把漏掉的补回来；
+/// - 2×2 分块：3×2 的瓦片边界正好切过某一列二维码时，这一列在两个瓦片里都残缺，
+///   换一组更大的瓦片就能完整包住它（实测 4 宫格预览的左下角就是这样漏掉的）。
 ///
-/// 两路都没结果时再做一次整数倍放大重试（见 `detect_with_upscale`）。
+/// 都没拿全时再做一次整数倍放大重试（见 `detect_with_upscale`，大图会跳过）。
 fn detect_multi(gray: GrayImage, verbose: bool) -> Batch {
     detect_multi_inner(gray, verbose, false)
 }
@@ -1435,24 +1437,28 @@ fn detect_multi_inner(gray: GrayImage, verbose: bool, force_upscale: bool) -> Ba
     // 放大重试还要用原图，这里额外留一份
     let retry_gray = gray.clone();
 
-    let (full, tiled) = thread::scope(|scope| {
+    let (full, tiled, tiled2) = thread::scope(|scope| {
         let full_handle = scope.spawn(move || detect_from_gray(full_gray, verbose));
         let tile_handle = scope.spawn(|| detect_tiles(&gray, 3, 2, 0.25, verbose));
+        // 3×2 的分块边界可能正好切过一列二维码（这一列在两个瓦片里都残缺），
+        // 再叠一路 2×2 的大瓦片取并集：大瓦片能完整包住这一列，补回被切掉的码。
+        let tile2_handle = scope.spawn(|| detect_tiles(&gray, 2, 2, 0.25, verbose));
 
         (
             full_handle.join().unwrap_or_else(|_| Batch::empty()),
             tile_handle.join().unwrap_or_else(|_| Batch::empty()),
+            tile2_handle.join().unwrap_or_else(|_| Batch::empty()),
         )
     });
 
     let full_grids = full.full_grids;
     let full_decoded = full.full_decoded;
-    let tile_grids = tiled.tile_grids;
-    let tile_decoded = tiled.tile_decoded;
+    let tile_grids = tiled.tile_grids + tiled2.tile_grids;
+    let tile_decoded = tiled.tile_decoded + tiled2.tile_decoded;
 
     let mut payloads = full.payloads;
     let mut extra = 0usize;
-    for payload in tiled.payloads {
+    for payload in tiled.payloads.into_iter().chain(tiled2.payloads) {
         if !payloads.contains(&payload) {
             payloads.push(payload);
             extra += 1;
@@ -1461,7 +1467,26 @@ fn detect_multi_inner(gray: GrayImage, verbose: bool, force_upscale: bool) -> Ba
 
     // 一张都没拿到，或"检测到网格却解不出"时，多半是二维码在屏幕上渲染得太小、
     // 模块边界落在非整数像素上。整数倍最近邻放大能把模块重新对齐，实测能把整屏救回来。
-    let need_retry = payloads.is_empty() || full_decoded < full_grids;
+    //
+    // 但整帧放大很贵，而且 rqrr 在超大图上遇到假定位图案会长时间空转：2505x1329
+    // 放大 2 倍是 1330 万像素，实测单帧 detect_grids 17~53 秒。超过像素上限就放弃
+    // 整帧重试（--force_upscale 的测试路径不受限制），让分块检测与下一轮轮播补漏。
+    let frame_pixels = retry_gray.width() as u64 * retry_gray.height() as u64;
+    let upscale_too_big = frame_pixels * 4 > UPSCALE_MAX_PIXELS;
+    if upscale_too_big && !UPSCALE_TOO_BIG_WARNED.swap(true, Ordering::Relaxed) {
+        detail(
+            "提示",
+            format!(
+                "整帧放大重试已跳过：{}x{} 放大 2 倍后约 {} 万像素，超过上限 {} 万；改由分块检测与下一轮轮播补漏",
+                retry_gray.width(),
+                retry_gray.height(),
+                frame_pixels * 4 / 10_000,
+                UPSCALE_MAX_PIXELS / 10_000
+            ),
+        );
+    }
+    let need_retry =
+        (force_upscale || !upscale_too_big) && (payloads.is_empty() || full_decoded < full_grids);
     let retried = need_retry && (force_upscale || upscale_retry_allowed());
     let mut retry_grids = 0usize;
     let mut retry_decoded = 0usize;
@@ -1498,6 +1523,17 @@ const UPSCALE_FACTORS: [u32; 2] = [2, 3];
 /// 整帧放大重跑一次的成本和整帧检测本身同量级，而"屏幕上根本没有二维码"的帧很常见，
 /// 不设闸门会白白浪费 CPU。
 const UPSCALE_RETRY_GAP_MS: u64 = 500;
+
+/// 整帧放大重试的像素上限（放大 2 倍后的像素数）
+///
+/// rqrr 0.7 在整帧 2 倍放大后遇到假定位图案时，可能进入近乎无界的对齐图案搜索：
+/// 实测 2505x1329（放大后 1330 万像素）单帧 detect_grids 17~53 秒，期间完全不截屏，
+/// 1 秒一页的轮播会白翻十几页。大屏原生尺寸布局直接放弃整帧重试，
+/// 由分块检测和下一轮轮播兜底；1080p 及以下仍保留原来的放大兜底。
+const UPSCALE_MAX_PIXELS: u64 = 10_000_000;
+
+/// 只提示一次"因像素过大跳过放大重试"
+static UPSCALE_TOO_BIG_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// 上一次放大重试的时刻（相对进程启动的毫秒数）
 static LAST_UPSCALE_RETRY_MS: AtomicU64 = AtomicU64::new(0);

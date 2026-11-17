@@ -73,6 +73,8 @@ async fn main() -> Result<()> {
         }
     };
 
+    
+
     if args.help {
         print_usage();
         return Ok(());
