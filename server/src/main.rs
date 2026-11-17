@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -469,8 +470,22 @@ fn detect_from_rgba(rgba: &[u8], width: usize, height: usize, verbose: bool) -> 
 /// - 整图检测：对 1/2/4/6 宫格的大二维码最有效；
 /// - 分块检测：小窗口下二维码排列紧凑时，rqrr 的定位图案分组会串味，
 ///   切块后每块最多一两张码，可以把漏掉的补回来。
+/// 整图检测 + 分块检测，两路并行，取并集
+///
+/// - 整图检测：对 1/2/4/6 宫格的大二维码最有效；
+/// - 分块检测：小窗口下二维码排列紧凑时，rqrr 的定位图案分组会串味，
+///   切块后每块最多一两张码，可以把漏掉的补回来。
+///
+/// 两路都没结果时再做一次整数倍放大重试（见 `detect_with_upscale`）。
 fn detect_multi(gray: GrayImage, verbose: bool) -> Batch {
+    detect_multi_inner(gray, verbose, false)
+}
+
+/// `detect_multi` 的实现；`force_upscale` 供测试跳过限流直接验证放大重试
+fn detect_multi_inner(gray: GrayImage, verbose: bool, force_upscale: bool) -> Batch {
     let full_gray = gray.clone();
+    // 放大重试还要用原图，这里额外留一份
+    let retry_gray = gray.clone();
 
     let (full, tiled) = thread::scope(|scope| {
         let full_handle = scope.spawn(move || detect_from_gray(full_gray, verbose));
@@ -482,6 +497,9 @@ fn detect_multi(gray: GrayImage, verbose: bool) -> Batch {
         )
     });
 
+    let full_grids = full.grids;
+    let full_decoded = full.payloads.len();
+
     let mut payloads = full.payloads;
     for payload in tiled.payloads {
         if !payloads.contains(&payload) {
@@ -489,11 +507,96 @@ fn detect_multi(gray: GrayImage, verbose: bool) -> Batch {
         }
     }
 
+    let mut grids = full.grids.max(tiled.grids);
+    let mut decode_failed = full.decode_failed + tiled.decode_failed;
+
+    // 一张都没拿到，或"检测到网格却解不出"时，多半是二维码在屏幕上渲染得太小、
+    // 模块边界落在非整数像素上。整数倍最近邻放大能把模块重新对齐，实测能把整屏救回来。
+    let need_retry = payloads.is_empty() || full_decoded < full_grids;
+    if need_retry && (force_upscale || upscale_retry_allowed()) {
+        let retry = detect_with_upscale(&retry_gray, verbose);
+        grids = grids.max(retry.grids);
+        decode_failed += retry.decode_failed;
+        for payload in retry.payloads {
+            if !payloads.contains(&payload) {
+                payloads.push(payload);
+            }
+        }
+    }
+
     Batch {
         payloads,
-        grids: full.grids.max(tiled.grids),
-        decode_failed: full.decode_failed + tiled.decode_failed,
+        grids,
+        decode_failed,
     }
+}
+
+/// 放大重试的倍率：2 倍能救回绝大多数"太小/非整数像素"的帧，3 倍作为兜底
+const UPSCALE_FACTORS: [u32; 2] = [2, 3];
+
+/// 两次放大重试之间的最小间隔（毫秒）
+///
+/// 整帧放大重跑一次的成本和整帧检测本身同量级，而"屏幕上根本没有二维码"的帧很常见，
+/// 不设闸门会白白浪费 CPU。
+const UPSCALE_RETRY_GAP_MS: u64 = 500;
+
+/// 上一次放大重试的时刻（相对进程启动的毫秒数）
+static LAST_UPSCALE_RETRY_MS: AtomicU64 = AtomicU64::new(0);
+static PROCESS_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// 判断本次是否允许做放大重试（限流）
+fn upscale_retry_allowed() -> bool {
+    let epoch = PROCESS_EPOCH.get_or_init(Instant::now);
+    let now = epoch.elapsed().as_millis() as u64;
+    let last = LAST_UPSCALE_RETRY_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < UPSCALE_RETRY_GAP_MS {
+        return false;
+    }
+    LAST_UPSCALE_RETRY_MS.store(now, Ordering::Relaxed);
+    true
+}
+
+/// 把整帧按整数倍最近邻放大后重新识别
+///
+/// 为什么是最近邻：浏览器渲染 SVG 用的是 crispEdges（无抗锯齿），模块边界本来就
+/// 吸附在像素上；最近邻放大只会把每个模块复制成 n×n 的方块，不会引入新的灰阶。
+/// 实测同一帧：原图只能解出 1/6，2 倍最近邻后 6/6；用 Triangle/CatmullRom
+/// 插值反而只剩 3/6 甚至 0/6。
+fn detect_with_upscale(gray: &GrayImage, verbose: bool) -> Batch {
+    use image::imageops;
+
+    let mut merged = Batch::empty();
+
+    for factor in UPSCALE_FACTORS {
+        let upscaled = imageops::resize(
+            gray,
+            gray.width() * factor,
+            gray.height() * factor,
+            imageops::FilterType::Nearest,
+        );
+        let batch = detect_from_gray(upscaled, verbose);
+        merged.grids = merged.grids.max(batch.grids);
+        merged.decode_failed += batch.decode_failed;
+
+        for payload in batch.payloads {
+            if !merged.payloads.contains(&payload) {
+                merged.payloads.push(payload);
+            }
+        }
+
+        if !merged.payloads.is_empty() {
+            if verbose {
+                println!(
+                    "[调试] 放大 {} 倍后识别出 {} 张二维码",
+                    factor,
+                    merged.payloads.len()
+                );
+            }
+            break;
+        }
+    }
+
+    merged
 }
 
 /// 从灰度图中批量识别所有二维码
@@ -1241,6 +1344,69 @@ mod tests {
             side
         );
         assert_eq!(got, want, "识别出的载荷与原始载荷不一致");
+    }
+
+    /// 二维码太小导致整屏一张都解不出时，放大重试必须把整屏救回来
+    ///
+    /// 复现的是"小窗口 + 每屏 6 张"：每张只有 1 像素/模块，rqrr 连定位图案都扫不出来
+    /// （会断言 panic，已被隔离）。最近邻放大 2 倍后每模块变成 2×2 像素，应当全中。
+    #[test]
+    fn upscale_retry_recovers_too_small_screen() {
+        use image::imageops;
+        use qrcode::QrCode;
+
+        const CHUNK: usize = 2000;
+        let alphabet: Vec<u8> =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".to_vec();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next_char = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            alphabet[(seed >> 33) as usize % alphabet.len()] as char
+        };
+
+        let payloads: Vec<String> = (1..=6)
+            .map(|i| {
+                let body: String = (0..CHUNK).map(|_| next_char()).collect();
+                format!("{}/6|{}", i, body)
+            })
+            .collect();
+
+        // 177 模块 -> 每张 177px，即 1 像素/模块
+        let (sw, sh, cols, rows) = (1363u32, 964u32, 3u32, 2u32);
+        let side = 177u32;
+        let (cw, ch) = (sw / cols, sh / rows);
+        let mut canvas = GrayImage::from_pixel(sw, sh, image::Luma([255u8]));
+
+        for (i, payload) in payloads.iter().enumerate() {
+            let qr = QrCode::new(payload.as_bytes()).expect("生成二维码失败");
+            let rendered = qr
+                .render::<image::Luma<u8>>()
+                .quiet_zone(true)
+                .min_dimensions(side, side)
+                .max_dimensions(side, side)
+                .build();
+            let x = (i as u32 % cols) * cw + (cw - side) / 2;
+            let y = (i as u32 / cols) * ch + (ch - side) / 2;
+            imageops::replace(&mut canvas, &rendered, x as i64, y as i64);
+        }
+
+        // 原尺寸：一张都拿不到
+        let plain = detect_from_gray(canvas.clone(), false);
+        assert!(
+            plain.payloads.is_empty(),
+            "1 像素/模块的帧不应能直接解出，实际解出 {} 张",
+            plain.payloads.len()
+        );
+
+        // 放大重试：6 张全部回来
+        let batch = detect_multi_inner(canvas, false, true);
+        let mut got = batch.payloads.clone();
+        got.sort();
+        let mut want = payloads.clone();
+        want.sort();
+        assert_eq!(got, want, "放大重试应把 6 张全部救回来");
     }
 
     /// 二维码过小/过密时 rqrr 会 assert panic，必须被隔离而不是让进程崩掉

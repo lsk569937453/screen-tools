@@ -124,6 +124,9 @@
                 background: #ffffff;
                 border-radius: 4px;
                 display: none;
+                /* 尺寸由 fitSlots() 按"整数倍模块"算出来，比格子略小时居中摆放 */
+                justify-self: center;
+                align-self: center;
             }
 
             /* 高亮描边画在图片外侧，绝不遮挡二维码模块 */
@@ -476,6 +479,114 @@
                 slots.push(img);
             }
 
+            // ── 二维码显示尺寸：必须按"整数倍模块"渲染 ──────────────────────
+            // client 生成的 SVG 带 shape-rendering="crispEdges"，浏览器会关掉抗锯齿，
+            // 把每个模块的边界直接对齐到设备像素。只要"每模块占几个像素"不是整数，
+            // 模块宽度就会变成 2/3 像素交替，定位图案和时序图案跟着变形，
+            // 接收端 rqrr 会连网格都定位不到（实测 445px 宽时 0 命中，354px 时一次成功）。
+            // 所以这里把显示尺寸吸附成 "n × 模块数" 个设备像素，n 取能放下的最大整数。
+            let qrModules = 0; // 每边模块数（含两侧各 4 个静区模块）
+            let qrProbed = false;
+
+            // 量一次 SVG 的模块几何：静区固定 4 个模块，所以第一个黑像素的 x 坐标 = 4 × 模块像素
+            function probeQrGeometry(img) {
+                if (qrProbed || !img) {
+                    return;
+                }
+                qrProbed = true;
+
+                const measure = () => {
+                    try {
+                        const w = img.naturalWidth;
+                        const h = img.naturalHeight;
+                        if (!w || !h) {
+                            throw new Error("SVG 缺少自然尺寸");
+                        }
+
+                        const canvas = document.createElement("canvas");
+                        canvas.width = w;
+                        canvas.height = h;
+                        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+                        ctx.drawImage(img, 0, 0, w, h);
+                        const { data } = ctx.getImageData(0, 0, w, h);
+
+                        let left = w;
+                        for (let y = 0; y < h && left > 0; y++) {
+                            for (let x = 0; x < left; x++) {
+                                const i = (y * w + x) * 4;
+                                const luma =
+                                    (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000;
+                                if (luma < 128) {
+                                    left = x;
+                                    break;
+                                }
+                            }
+                        }
+
+                        const unit = left / 4; // 一个模块占多少 SVG 像素
+                        if (unit > 0 && Number.isInteger(unit) && w % unit === 0) {
+                            qrModules = w / unit;
+                        }
+                    } catch (error) {
+                        console.warn("二维码模块数测量失败，回退默认值 177", error);
+                    }
+                    if (!qrModules) {
+                        qrModules = 177; // 2000 字节/片（version 38）时的模块数
+                    }
+                    fitSlots();
+                };
+
+                if (img.complete && img.naturalWidth) {
+                    measure();
+                } else {
+                    img.addEventListener("load", measure, { once: true });
+                }
+            }
+
+            // 把槽位尺寸吸附到整数倍模块：每模块 = n 个设备像素（n >= 2 才稳）
+            function fitSlots() {
+                if (!qrModules || !qrGrid.clientWidth) {
+                    return;
+                }
+                const gs = getComputedStyle(qrGrid);
+                const gap = parseFloat(gs.columnGap) || 0;
+                const cols = parseInt(gs.getPropertyValue("--cols"), 10) || 1;
+                const rows = parseInt(gs.getPropertyValue("--rows"), 10) || 1;
+                const cellW = (qrGrid.clientWidth - gap * (cols - 1)) / cols;
+                const cellH = (qrGrid.clientHeight - gap * (rows - 1)) / rows;
+                if (cellW <= 0 || cellH <= 0) {
+                    return;
+                }
+
+                const dpr = window.devicePixelRatio || 1;
+                const n = Math.max(1, Math.floor(Math.min(cellW * dpr, cellH * dpr) / qrModules));
+                const cssSize = (n * qrModules) / dpr;
+                slots.forEach((slot) => {
+                    slot.style.width = `${cssSize}px`;
+                    slot.style.height = `${cssSize}px`;
+                });
+                if (n < 2) {
+                    // 每模块只剩 1 像素时 rqrr 连定位图案都拼不出来，准备阶段就把话说清楚
+                    console.warn(
+                        `每模块只有 ${n} 像素，接收端可能识别不了：请全屏，或用每屏 1~2 张`
+                    );
+                    if (!document.body.classList.contains("playing")) {
+                        statusSpan.textContent = "⚠️";
+                        statusText.textContent = "窗口偏小，请全屏或减少每屏张数";
+                    }
+                } else if (
+                    !document.body.classList.contains("playing") &&
+                    statusText.textContent.startsWith("窗口偏小")
+                ) {
+                    statusSpan.textContent = "▶️";
+                    statusText.textContent = "准备就绪";
+                }
+            }
+
+            // 窗口尺寸 / 全屏状态变化后重新吸附
+            window.addEventListener("resize", () => requestAnimationFrame(fitSlots));
+            document.addEventListener("fullscreenchange", () => requestAnimationFrame(fitSlots));
+
             function pad3(n) {
                 return String(n).padStart(3, "0");
             }
@@ -573,6 +684,7 @@
                     );
                     applyGridPreset();
                     updateDisplay();
+                    probeQrGeometry(slots[0]);
                     statusSpan.textContent = "▶️";
                     statusText.textContent = "准备就绪";
                     startPlayBtn.disabled = false;
@@ -594,6 +706,8 @@
                 focusSeq = null;
                 document.body.classList.add("playing");
                 updateDisplay();
+                // 播放模式会隐藏顶栏/控件，格子尺寸变了，重新吸附一次
+                requestAnimationFrame(fitSlots);
                 startPlay();
             }
 
@@ -660,6 +774,7 @@
                 pageIndex = 0;
                 focusSeq = null;
                 updateDisplay();
+                requestAnimationFrame(fitSlots);
                 statusSpan.textContent = "▶️";
                 statusText.textContent = "准备就绪";
             }
@@ -716,6 +831,7 @@
                 pageIndex = Math.floor((anchor - 1) / perPage);
                 applyGridPreset();
                 updateDisplay();
+                fitSlots();
             });
 
             // 空格播放/暂停，左右方向键翻屏，Esc 退出播放模式
