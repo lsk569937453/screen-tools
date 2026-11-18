@@ -104,9 +104,16 @@ pub fn decode_frame(
         return Err(DetectError::BadGeometry { module_x, module_y });
     }
 
-    let (slots, slot_count, crc_failures) = sample_slots(
-        gray, width, height, threshold, rect, &header, module_x, module_y,
-    );
+    let (slots, slot_count, crc_failures) = sample_slots(&SampleSpec {
+        gray,
+        width,
+        height,
+        threshold,
+        rect,
+        header: &header,
+        module_x,
+        module_y,
+    });
 
     Ok(DecodedFrame {
         header,
@@ -158,8 +165,9 @@ pub fn otsu(gray: &[u8]) -> u8 {
     let mut best_t = 128u8;
     let mut best_var = -1.0f64;
 
-    for t in 0..256 {
-        w_b += hist[t] as u64;
+    for (t, &count) in hist.iter().enumerate() {
+        let count = count as u64;
+        w_b += count;
         if w_b == 0 {
             continue;
         }
@@ -167,7 +175,7 @@ pub fn otsu(gray: &[u8]) -> u8 {
         if w_f == 0 {
             break;
         }
-        sum_b += t as u64 * hist[t] as u64;
+        sum_b += t as u64 * count;
         let m_b = sum_b as f64 / w_b as f64;
         let m_f = (sum - sum_b) as f64 / w_f as f64;
         let var = w_b as f64 * w_f as f64 * (m_b - m_f).powi(2);
@@ -392,17 +400,30 @@ fn sample_module(
     dark >= 3
 }
 
-/// 按固定 slot 长度采样数据区
-fn sample_slots(
-    gray: &[u8],
+/// 按固定 slot 长度采样数据区所需的输入
+struct SampleSpec<'a> {
+    gray: &'a [u8],
     width: usize,
     height: usize,
     threshold: u8,
     rect: Rect,
-    header: &Header,
+    header: &'a Header,
     module_x: f64,
     module_y: f64,
-) -> (Vec<SlotRecord>, usize, usize) {
+}
+
+/// 按固定 slot 长度采样数据区
+fn sample_slots(spec: &SampleSpec<'_>) -> (Vec<SlotRecord>, usize, usize) {
+    let SampleSpec {
+        gray,
+        width,
+        height,
+        threshold,
+        rect,
+        header,
+        module_x,
+        module_y,
+    } = *spec;
     let slot_bytes = header.slot_bytes();
     let slot_bits = slot_bytes * 8;
     let grid_w = header.grid_w as usize;
@@ -476,22 +497,22 @@ fn sample_slots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::header::Header;
+    use crate::header::{Header, HeaderSpec};
     use crate::layout::Geometry;
     use crate::render::render_png;
 
     fn make_header(geo: &Geometry) -> Header {
-        Header::new(
-            geo.module_px,
-            geo.grid_w,
-            geo.grid_h,
-            geo.block_bytes,
-            10,
-            2,
-            12,
-            40_000,
-            [1, 2, 3, 4, 5, 6, 7, 8],
-        )
+        Header::new(HeaderSpec {
+            module_px: geo.module_px,
+            grid_w: geo.grid_w,
+            grid_h: geo.grid_h,
+            block_bytes: geo.block_bytes,
+            k: 10,
+            m: 2,
+            total_shards: 12,
+            file_len: 40_000,
+            hash_prefix: [1, 2, 3, 4, 5, 6, 7, 8],
+        })
     }
 
     /// 把 PNG 解码成灰度（测试用，避免依赖 image crate）
@@ -519,7 +540,7 @@ mod tests {
         gray[..500].fill(10);
         gray[500..].fill(240);
         let t = otsu(&gray);
-        assert!(t >= 10 && t <= 240, "threshold={}", t);
+        assert!((10..=240).contains(&t), "threshold={}", t);
     }
 
     #[test]

@@ -17,29 +17,33 @@ pub struct Header {
     pub hash_prefix: [u8; 8],
 }
 
+/// 构造帧头所需的全部字段，避免 `Header::new` 参数过多
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderSpec {
+    pub module_px: u32,
+    pub grid_w: u32,
+    pub grid_h: u32,
+    pub block_bytes: usize,
+    pub k: usize,
+    pub m: usize,
+    pub total_shards: usize,
+    pub file_len: u64,
+    pub hash_prefix: [u8; 8],
+}
+
 impl Header {
-    pub fn new(
-        module_px: u32,
-        grid_w: u32,
-        grid_h: u32,
-        block_bytes: usize,
-        k: usize,
-        m: usize,
-        total_shards: usize,
-        file_len: u64,
-        hash_prefix: [u8; 8],
-    ) -> Self {
+    pub fn new(spec: HeaderSpec) -> Self {
         Self {
             version: FORMAT_VERSION,
-            module_px: module_px.min(255) as u8,
-            grid_w: grid_w as u16,
-            grid_h: grid_h as u16,
-            block_bytes: block_bytes as u16,
-            k: k as u16,
-            m: m as u16,
-            total_shards: total_shards as u32,
-            file_len,
-            hash_prefix,
+            module_px: spec.module_px.min(255) as u8,
+            grid_w: spec.grid_w as u16,
+            grid_h: spec.grid_h as u16,
+            block_bytes: spec.block_bytes as u16,
+            k: spec.k as u16,
+            m: spec.m as u16,
+            total_shards: spec.total_shards as u32,
+            file_len: spec.file_len,
+            hash_prefix: spec.hash_prefix,
         }
     }
 
@@ -49,11 +53,7 @@ impl Header {
 
     pub fn groups(&self) -> usize {
         let per = self.k as usize + self.m as usize;
-        if per == 0 {
-            0
-        } else {
-            self.total_shards as usize / per
-        }
+        (self.total_shards as usize).checked_div(per).unwrap_or(0)
     }
 
     pub fn data_blocks(&self) -> usize {
@@ -113,7 +113,7 @@ impl Header {
             || k == 0
             || k + m > 256
             || total_shards == 0
-            || total_shards % (k + m) != 0
+            || !total_shards.is_multiple_of(k + m)
             || file_len == 0
         {
             return None;
@@ -167,17 +167,17 @@ mod tests {
     use super::*;
 
     fn sample() -> Header {
-        Header::new(
-            2,
-            1244,
-            656,
-            4096,
-            100,
-            10,
-            8470,
-            31_457_280,
-            [1, 2, 3, 4, 5, 6, 7, 8],
-        )
+        Header::new(HeaderSpec {
+            module_px: 2,
+            grid_w: 1244,
+            grid_h: 656,
+            block_bytes: 4096,
+            k: 100,
+            m: 10,
+            total_shards: 8470,
+            file_len: 31_457_280,
+            hash_prefix: [1, 2, 3, 4, 5, 6, 7, 8],
+        })
     }
 
     #[test]

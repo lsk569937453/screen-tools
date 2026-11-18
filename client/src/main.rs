@@ -11,65 +11,31 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use axum_embed::ServeEmbed;
+use clap::Parser;
+use common::{digest, format, logging};
 use rust_embed::RustEmbed;
 use screencode::fec;
-use screencode::header::Header;
+use screencode::header::{Header, HeaderSpec};
 use screencode::layout::Geometry;
 use screencode::render::render_png;
 use screencode::shard::encode_slot;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::path::Path as FsPath;
 use std::sync::{Arc, Mutex};
+use tracing::{debug, error, info, warn};
 
-const DEFAULT_PORT: u16 = 9090;
-const DEFAULT_PROCESS: &str = "HSR";
-const DEFAULT_FRAME: (u32, u32) = (1920, 1080);
-const DEFAULT_MODULE_PX: u32 = 2;
-const DEFAULT_DWELL_MS: u64 = 300;
+mod cli;
+
+use cli::{Cli, FrameSpec};
+
+const LOG_DIR: &str = "logs";
 const MAX_CACHED_FRAMES: usize = 4;
 
 #[derive(RustEmbed, Clone)]
 #[folder = "web/"]
 struct Assets;
-
-#[derive(Debug, Clone)]
-struct Args {
-    file: Option<String>,
-    frame: Option<(u32, u32)>,
-    auto_frame: bool,
-    module_px: u32,
-    block_bytes: usize,
-    parity: f64,
-    dwell_ms: u64,
-    export: Option<String>,
-    port: u16,
-    process: String,
-    probe: bool,
-    help: bool,
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Self {
-            file: None,
-            frame: None,
-            auto_frame: false,
-            module_px: DEFAULT_MODULE_PX,
-            block_bytes: screencode::DEFAULT_BLOCK_BYTES,
-            parity: 0.10,
-            dwell_ms: DEFAULT_DWELL_MS,
-            export: None,
-            port: DEFAULT_PORT,
-            process: DEFAULT_PROCESS.to_string(),
-            probe: false,
-            help: false,
-        }
-    }
-}
 
 /// 一帧的播放状态
 struct Player {
@@ -177,31 +143,41 @@ struct Info {
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("错误: {}", error);
+    let cli = Cli::parse();
+    if cli.wants_help() {
+        if let Err(error) = cli::print_help() {
+            eprintln!("打印帮助失败: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let log = match logging::init("client", cli.verbose, Some(FsPath::new(LOG_DIR))) {
+        Ok(log) => log,
+        Err(error) => {
+            eprintln!("初始化日志失败: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(error) = &log.file_error {
+        warn!("日志文件不可用，仅输出到控制台: {error}");
+    }
+    if let Some(path) = &log.file {
+        info!("日志文件: {}", path.display());
+    }
+
+    if let Err(error) = run(cli).await {
+        error!("{error}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<()> {
-    let args = parse_args(&env::args().collect::<Vec<_>>());
-
-    // `client help` 与 `client --help` 等价
-    let wants_help = args.help
-        || args
-            .file
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("help"));
-    if wants_help {
-        print_usage();
-        return Ok(());
+async fn run(cli: Cli) -> Result<()> {
+    if cli.probe {
+        return probe_window(&cli.process);
     }
 
-    if args.probe {
-        return probe_window(&args.process);
-    }
-
-    let file_path = args
+    let file_path = cli
         .file
         .as_deref()
         .ok_or_else(|| anyhow!("缺少文件参数。用法: client <文件路径> [选项]，或 client --help"))?;
@@ -215,30 +191,28 @@ async fn run() -> Result<()> {
         return Err(anyhow!("文件为空，无法生成"));
     }
 
-    let (frame_w, frame_h) = resolve_frame(&args)?;
-    let geometry = Geometry::plan(frame_w, frame_h, args.module_px, args.block_bytes)?;
-    let plan = fec::plan(file.len(), args.block_bytes, args.parity)?;
+    let (frame_w, frame_h) = resolve_frame(&cli);
+    let geometry = Geometry::plan(frame_w, frame_h, cli.module_px, cli.block_bytes)?;
+    let plan = fec::plan(file.len(), cli.block_bytes, cli.parity)?;
 
-    let mut hasher = Sha256::new();
-    hasher.update(&file);
-    let digest = hasher.finalize();
+    let digest_bytes = digest::sha256(&file);
     let mut hash_prefix = [0u8; 8];
-    hash_prefix.copy_from_slice(&digest[..8]);
-    let hash_hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+    hash_prefix.copy_from_slice(&digest_bytes[..8]);
+    let hash_hex = hex::encode(digest_bytes);
 
     let started = std::time::Instant::now();
-    let shards = fec::encode_shards(&file, &plan, args.block_bytes)?;
-    let header = Header::new(
-        geometry.module_px,
-        geometry.grid_w,
-        geometry.grid_h,
-        geometry.block_bytes,
-        plan.k,
-        plan.m,
-        plan.total_shards,
-        file.len() as u64,
+    let shards = fec::encode_shards(&file, &plan, cli.block_bytes)?;
+    let header = Header::new(HeaderSpec {
+        module_px: geometry.module_px,
+        grid_w: geometry.grid_w,
+        grid_h: geometry.grid_h,
+        block_bytes: geometry.block_bytes,
+        k: plan.k,
+        m: plan.m,
+        total_shards: plan.total_shards,
+        file_len: file.len() as u64,
         hash_prefix,
-    );
+    });
 
     let player = Arc::new(Player::new(
         header.clone(),
@@ -246,18 +220,18 @@ async fn run() -> Result<()> {
         shards,
         file_path.to_string(),
         file.len() as u64,
-        args.dwell_ms,
+        cli.dwell_ms,
         hash_hex.clone(),
     ));
 
-    println!("文件: {}", file_path);
-    println!(
+    info!("文件: {}", file_path);
+    info!(
         "大小: {}（{} 字节）| SHA-256: {}",
-        format_file_size(file.len()),
+        format::format_bytes(file.len() as u64),
         file.len(),
         hash_hex
     );
-    println!(
+    info!(
         "版式: {}x{} px | 模块 {}px | 网格 {}x{} | 每帧 {} 个分片 / {}",
         geometry.frame_w,
         geometry.frame_h,
@@ -265,46 +239,45 @@ async fn run() -> Result<()> {
         geometry.grid_w,
         geometry.grid_h,
         player.slots_per_frame,
-        format_file_size(player.bytes_per_frame())
+        format::format_bytes(player.bytes_per_frame() as u64)
     );
-    println!(
+    info!(
         "码制: {} KB/帧({}) | k={} m={} | 分片 {} | 总帧数 {} | 停留 {} ms | 编码 {:.1}s",
         player.bytes_per_frame() / 1024,
-        format_file_size(player.bytes_per_frame()),
+        format::format_bytes(player.bytes_per_frame() as u64),
         plan.k,
         plan.m,
         plan.total_shards,
         player.frame_count,
-        args.dwell_ms,
+        cli.dwell_ms,
         started.elapsed().as_secs_f64()
     );
 
-    if let Some(dir) = args.export {
+    if let Some(dir) = cli.export {
         return export_all(&player, &dir);
     }
 
-    serve(player, args.port).await
+    serve(player, cli.port).await
 }
 
-fn resolve_frame(args: &Args) -> Result<(u32, u32)> {
-    if let Some(frame) = args.frame {
-        return Ok(frame);
+fn resolve_frame(cli: &Cli) -> (u32, u32) {
+    match cli.resolved_frame() {
+        FrameSpec::Fixed { width, height } => (width, height),
+        FrameSpec::Auto => match detect_frame(&cli.process) {
+            Some(frame) => frame,
+            None => {
+                let (width, height) = (cli::DEFAULT_FRAME_WIDTH, cli::DEFAULT_FRAME_HEIGHT);
+                warn!(
+                    "没有找到进程 {} 的窗口，回退到 {}x{}",
+                    cli.process, width, height
+                );
+                warn!(
+                    "--frame 必须 <= 播放页面的可视区（页面面板里会打印“页面可视区 WxH”），否则码图会被浏览器/任务栏裁掉，接收端找不到完整码框"
+                );
+                (width, height)
+            }
+        },
     }
-    if args.auto_frame {
-        if let Some(frame) = detect_frame(&args.process) {
-            return Ok(frame);
-        }
-        println!(
-            "警告: 没有找到进程 {} 的窗口，回退到 {}x{}",
-            args.process, DEFAULT_FRAME.0, DEFAULT_FRAME.1
-        );
-        println!(
-            "      --frame 必须 <= 播放页面的可视区（页面面板里会打印“页面可视区 WxH”），\
-             否则码图会被浏览器/任务栏裁掉，接收端找不到完整码框"
-        );
-        return Ok(DEFAULT_FRAME);
-    }
-    Ok(DEFAULT_FRAME)
 }
 
 #[cfg(windows)]
@@ -335,11 +308,11 @@ fn export_all(player: &Player, dir: &str) -> Result<()> {
         }
     }
     println!();
-    println!(
-        "✓ 已写出 {} 帧到 {}/（每帧 {}）",
+    info!(
+        "已写出 {} 帧到 {}/（每帧 {}）",
         player.frame_count,
         dir,
-        format_file_size(player.bytes_per_frame())
+        format::format_bytes(player.bytes_per_frame() as u64)
     );
     Ok(())
 }
@@ -394,6 +367,11 @@ async fn frame_png(State(player): State<Arc<Player>>, Path(name): Path<String>) 
     let player = player.clone();
     match tokio::task::spawn_blocking(move || player.frame_png(index)).await {
         Ok(Ok(png)) => {
+            debug!(
+                "渲染第 {} 帧（{}）",
+                index + 1,
+                format::format_bytes(png.len() as u64)
+            );
             let mut response = png.into_response();
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -406,11 +384,11 @@ async fn frame_png(State(player): State<Arc<Player>>, Path(name): Path<String>) 
             response
         }
         Ok(Err(error)) => {
-            eprintln!("渲染第 {} 帧失败: {}", index + 1, error);
+            error!("渲染第 {} 帧失败: {}", index + 1, error);
             (StatusCode::INTERNAL_SERVER_ERROR, "渲染失败").into_response()
         }
         Err(error) => {
-            eprintln!("渲染任务失败: {}", error);
+            error!("渲染任务失败: {}", error);
             (StatusCode::INTERNAL_SERVER_ERROR, "渲染任务失败").into_response()
         }
     }
@@ -427,154 +405,6 @@ async fn no_cache(request: axum::extract::Request, next: Next) -> Response {
         .headers_mut()
         .insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
     response
-}
-
-fn parse_args(raw: &[String]) -> Args {
-    let mut args = Args::default();
-    let mut iter = raw.iter().skip(1);
-
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-h" | "--help" => args.help = true,
-            "--probe" => args.probe = true,
-            "--auto" | "--frame=auto" => args.auto_frame = true,
-            "--frame" => {
-                let value = iter.next().map(|v| v.as_str()).unwrap_or("");
-                if value.eq_ignore_ascii_case("auto") {
-                    // 与 --frame=auto 等价（README 里写的就是这种空格形式）
-                    args.auto_frame = true;
-                } else {
-                    match parse_frame(value) {
-                        Some(frame) => args.frame = Some(frame),
-                        None => {
-                            eprintln!("--frame 需要 WxH，例如 2505x1329；收到 '{}'", value);
-                            std::process::exit(2);
-                        }
-                    }
-                }
-            }
-            other if other.starts_with("--frame=") => {
-                let value = &other["--frame=".len()..];
-                if value == "auto" {
-                    args.auto_frame = true;
-                } else if let Some(frame) = parse_frame(value) {
-                    args.frame = Some(frame);
-                } else {
-                    eprintln!("--frame 需要 WxH，例如 2505x1329；收到 '{}'", value);
-                    std::process::exit(2);
-                }
-            }
-            "--module-px" => {
-                args.module_px = parse_num(&mut iter, "--module-px", 1u32);
-            }
-            other if other.starts_with("--module-px=") => {
-                args.module_px = other["--module-px=".len()..].parse().unwrap_or(0).max(1);
-            }
-            "--block-bytes" => {
-                args.block_bytes = parse_num(&mut iter, "--block-bytes", 4096usize);
-            }
-            other if other.starts_with("--block-bytes=") => {
-                args.block_bytes = other["--block-bytes=".len()..].parse().unwrap_or(0);
-            }
-            "--parity" => {
-                args.parity = iter.next().and_then(|v| v.parse().ok()).unwrap_or(0.10);
-            }
-            other if other.starts_with("--parity=") => {
-                args.parity = other["--parity=".len()..].parse().unwrap_or(0.10);
-            }
-            "--dwell-ms" => {
-                args.dwell_ms = parse_num(&mut iter, "--dwell-ms", DEFAULT_DWELL_MS);
-            }
-            other if other.starts_with("--dwell-ms=") => {
-                args.dwell_ms = other["--dwell-ms=".len()..]
-                    .parse()
-                    .unwrap_or(DEFAULT_DWELL_MS);
-            }
-            "--export" => {
-                args.export = Some(
-                    iter.next()
-                        .map(|v| v.as_str())
-                        .unwrap_or("qr_output")
-                        .to_string(),
-                );
-            }
-            other if other.starts_with("--export=") => {
-                args.export = Some(other["--export=".len()..].to_string());
-            }
-            "--port" => {
-                args.port = parse_num(&mut iter, "--port", DEFAULT_PORT);
-            }
-            other if other.starts_with("--port=") => {
-                args.port = other["--port=".len()..].parse().unwrap_or(DEFAULT_PORT);
-            }
-            "--process" => {
-                args.process = iter
-                    .next()
-                    .map(|v| v.as_str())
-                    .unwrap_or(DEFAULT_PROCESS)
-                    .to_string();
-            }
-            other if other.starts_with("--process=") => {
-                args.process = other["--process=".len()..].to_string();
-            }
-            other if other.starts_with('-') => {
-                eprintln!(
-                    "未知参数 '{}'；用 client --help 查看完整用法和示例",
-                    other
-                );
-                std::process::exit(2);
-            }
-            other => {
-                if args.file.is_some() {
-                    eprintln!("只能指定一个文件，多余参数 '{}'", other);
-                    std::process::exit(2);
-                }
-                args.file = Some(other.to_string());
-            }
-        }
-    }
-
-    args
-}
-
-fn parse_num<'a, I, T>(iter: &mut I, name: &str, default: T) -> T
-where
-    I: Iterator<Item = &'a String>,
-    T: std::str::FromStr,
-{
-    match iter.next() {
-        Some(value) => match value.parse() {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                eprintln!("{} 需要数字，收到 '{}'", name, value);
-                std::process::exit(2);
-            }
-        },
-        None => default,
-    }
-}
-
-fn parse_frame(value: &str) -> Option<(u32, u32)> {
-    let (w, h) = value.split_once('x').or_else(|| value.split_once('X'))?;
-    let w: u32 = w.trim().parse().ok()?;
-    let h: u32 = h.trim().parse().ok()?;
-    if w >= 320 && h >= 240 && w <= 8192 && h <= 8192 {
-        Some((w, h))
-    } else {
-        None
-    }
-}
-
-fn format_file_size(bytes: usize) -> String {
-    const KB: usize = 1024;
-    const MB: usize = 1024 * 1024;
-    if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
 }
 
 #[cfg(windows)]
@@ -605,119 +435,4 @@ fn probe_window(process: &str) -> Result<()> {
 #[cfg(not(windows))]
 fn probe_window(_process: &str) -> Result<()> {
     Err(anyhow!("窗口探测只支持 Windows；请用 --frame WxH 手动指定"))
-}
-
-/// 帮助文本（`client -h` / `client --help` / `client help`）
-fn usage_text() -> String {
-    [
-        "ScreenCode 发送端（单张高密度网格码 v1）",
-        "",
-        "用法:",
-        "  client <文件> [选项]            生成码图并起 HTTP 播放服务（默认端口 9090）",
-        "  client <文件> --export DIR      只导出 frame_*.png 到 DIR 后退出",
-        "  client --probe                  打印目标窗口客户区尺寸（决定 --frame）",
-        "  client -h | --help | help       显示本帮助",
-        "",
-        "先读这段:",
-        "  码图是 frame_w × frame_h 的 1-bit PNG，播放页按设备像素 1:1 摆放，",
-        "  所以 --frame 必须 <= 播放页面的「可视区」（页面面板会打印，例如 页面可视区 1912x857）。",
-        "  比可视区大 → 右侧/底部被裁 → 黑边框不闭合 → 接收端一直报「没有找到码框」。",
-        "  可视区 = 窗口去掉浏览器标签栏/地址栏、再减去任务栏；F11 全屏 + 任务栏自动隐藏最大。",
-        "",
-        "选项:",
-        "  版式:",
-        "    --frame WxH            目标帧尺寸（默认 1920x1080）",
-        "    --frame auto           读 --process 窗口的客户区尺寸（窗口被缩放后会变）",
-        "    --module-px N          每模块像素（默认 2；1 更密但要求严格 1:1；3 更稳）",
-        "    --block-bytes N        分片净荷字节（默认 4096）",
-        "    --parity F             纠删码冗余比例（默认 0.10，0 表示关闭）",
-        "  播放:",
-        "    --dwell-ms N           每帧停留毫秒（默认 300）",
-        "    --port N               HTTP 端口（默认 9090）",
-        "  窗口:",
-        "    --process NAME         --frame auto / --probe 匹配的进程（默认 HSR）",
-        "  导出:",
-        "    --export DIR           只导出 PNG 帧到 DIR，不起服务",
-        "  其它:",
-        "    -h, --help             显示本帮助",
-        "",
-        "示例:",
-        "  # 1) 最常用：按页面可视区生成并播放（尺寸抄页面面板里的「页面可视区 WxH」）",
-        "  client .\\big.zip --frame 1912x856",
-        "",
-        "  # 2) 先探窗口，再让发送端自动取窗口客户区尺寸",
-        "  client --probe",
-        "  client .\\big.zip --frame auto",
-        "",
-        "  # 3) 更密：约 4 倍容量，但要求严格 1:1（必须是设备像素 1:1、不能有任何缩放）",
-        "  client .\\big.zip --frame 1900x820 --module-px 1",
-        "",
-        "  # 4) 遮挡/反光多：把冗余提到 20%（收满仍自动纠删，只是帧数变多）",
-        "  client .\\big.zip --frame 1912x856 --parity 0.2",
-        "",
-        "  # 5) 离线导出 + 自检整条链路（不依赖窗口和播放页）",
-        "  client .\\big.zip --export qr_output --frame 1900x820",
-        "  cargo run -p screencode --example verify_frames -- qr_output",
-    ]
-    .join("\n")
-}
-
-fn print_usage() {
-    println!("{}", usage_text());
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(values: &[&str]) -> Vec<String> {
-        values.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn parses_file_and_frame() {
-        let parsed = parse_args(&args(&["client", "a.bin", "--frame", "2505x1329"]));
-        assert_eq!(parsed.file.as_deref(), Some("a.bin"));
-        assert_eq!(parsed.frame, Some((2505, 1329)));
-    }
-
-    #[test]
-    fn parses_auto_frame_and_options() {
-        let parsed = parse_args(&args(&[
-            "client",
-            "a.bin",
-            "--frame=auto",
-            "--module-px",
-            "1",
-            "--parity",
-            "0.2",
-        ]));
-        assert!(parsed.auto_frame);
-        assert_eq!(parsed.module_px, 1);
-        assert!((parsed.parity - 0.2).abs() < 1e-9);
-    }
-
-    #[test]
-    fn parses_auto_frame_in_space_form() {
-        // README 里写的是 `--frame auto`，空格形式也必须能认
-        let parsed = parse_args(&args(&["client", "a.bin", "--frame", "auto"]));
-        assert!(parsed.auto_frame);
-        assert_eq!(parsed.frame, None);
-    }
-
-    #[test]
-    fn usage_has_options_and_examples() {
-        let text = usage_text();
-        for needle in [
-            "用法:",
-            "选项:",
-            "示例:",
-            "--frame",
-            "--probe",
-            "--export",
-            "页面可视区",
-        ] {
-            assert!(text.contains(needle), "帮助文本缺少「{}」", needle);
-        }
-    }
 }

@@ -7,7 +7,6 @@ use anyhow::{anyhow, bail, Result};
 use screencode::fec;
 use screencode::header::Header;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -96,7 +95,7 @@ impl ShardStore {
         }
 
         let header_bytes =
-            hex_decode(&state.header).ok_or_else(|| anyhow!("会话里的帧头不是合法 hex"))?;
+            hex::decode(&state.header).map_err(|_| anyhow!("会话里的帧头不是合法 hex"))?;
         let header_array: [u8; 40] = header_bytes
             .as_slice()
             .try_into()
@@ -106,7 +105,7 @@ impl ShardStore {
 
         let total = header.total_shards as usize;
         let bitmap =
-            hex_decode(&state.received).ok_or_else(|| anyhow!("会话里的分片位图不是合法 hex"))?;
+            hex::decode(&state.received).map_err(|_| anyhow!("会话里的分片位图不是合法 hex"))?;
         let mut received = vec![false; total];
         for (i, byte) in bitmap.iter().enumerate() {
             for bit in 0..8 {
@@ -193,6 +192,7 @@ impl ShardStore {
         (self.received_count, self.total_shards())
     }
 
+    #[cfg(test)]
     pub fn has(&self, idx: usize) -> bool {
         self.received.get(idx).copied().unwrap_or(false)
     }
@@ -301,8 +301,8 @@ impl ShardStore {
         }
         let state = StateFile {
             format: FORMAT.to_string(),
-            header: hex_encode(&header.to_bytes()),
-            received: hex_encode(&bitmap),
+            header: hex::encode(header.to_bytes()),
+            received: hex::encode(&bitmap),
             updated_at: unix_now(),
         };
         let text = serde_json::to_string(&state)?;
@@ -311,10 +311,6 @@ impl ShardStore {
         fs::rename(&tmp, &self.paths.state)?;
         self.dirty = false;
         Ok(())
-    }
-
-    pub fn paths(&self) -> &ShardPaths {
-        &self.paths
     }
 }
 
@@ -347,36 +343,10 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{:02x}", b));
-    }
-    out
-}
-
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(text.len() / 2);
-    let bytes = text.as_bytes();
-    for i in (0..bytes.len()).step_by(2) {
-        let hi = (bytes[i] as char).to_digit(16)?;
-        let lo = (bytes[i + 1] as char).to_digit(16)?;
-        out.push(((hi << 4) | lo) as u8);
-    }
-    Some(out)
-}
-
-/// 取消重复计数的辅助：统计每个分片下标出现过的次数（诊断热区）
-pub fn bump(map: &mut HashMap<usize, u32>, key: usize) {
-    *map.entry(key).or_insert(0) += 1;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use screencode::header::HeaderSpec;
     use screencode::shard::encode_slot;
 
     fn temp_paths(tag: &str) -> ShardPaths {
@@ -388,7 +358,17 @@ mod tests {
     }
 
     fn sample_header() -> Header {
-        Header::new(2, 1244, 656, 1024, 10, 2, 12, 8000, [1; 8])
+        Header::new(HeaderSpec {
+            module_px: 2,
+            grid_w: 1244,
+            grid_h: 656,
+            block_bytes: 1024,
+            k: 10,
+            m: 2,
+            total_shards: 12,
+            file_len: 8000,
+            hash_prefix: [1; 8],
+        })
     }
 
     #[test]
@@ -473,7 +453,7 @@ mod tests {
     fn end_to_end_frames_loss_and_resume() {
         use screencode::detect::{decode_frame, DecodeOptions};
         use screencode::fec;
-        use screencode::header::Header;
+        use screencode::header::{Header, HeaderSpec};
         use screencode::layout::Geometry;
         use screencode::render::render_png;
         use screencode::PAD_SLOT;
@@ -483,17 +463,17 @@ mod tests {
         let plan = fec::plan(file.len(), block, 0.10).expect("plan");
         let shards = fec::encode_shards(&file, &plan, block).expect("encode");
         let geo = Geometry::plan(800, 600, 2, block).expect("geometry");
-        let header = Header::new(
-            2,
-            geo.grid_w,
-            geo.grid_h,
-            block,
-            plan.k,
-            plan.m,
-            plan.total_shards,
-            file.len() as u64,
-            [5u8; 8],
-        );
+        let header = Header::new(HeaderSpec {
+            module_px: 2,
+            grid_w: geo.grid_w,
+            grid_h: geo.grid_h,
+            block_bytes: block,
+            k: plan.k,
+            m: plan.m,
+            total_shards: plan.total_shards,
+            file_len: file.len() as u64,
+            hash_prefix: [5u8; 8],
+        });
 
         let paths = temp_paths("e2e");
         let mut store = ShardStore::create(paths.clone()).expect("create");
@@ -520,7 +500,7 @@ mod tests {
                     continue;
                 }
                 // 模拟 5% 的永久损坏：这些分片永远收不到
-                if rec.idx as usize % 20 == 0 {
+                if (rec.idx as usize).is_multiple_of(20) {
                     dropped += 1;
                     continue;
                 }

@@ -2,7 +2,7 @@
 
 use screencode::detect::{decode_frame, DecodeOptions};
 use screencode::fec;
-use screencode::header::Header;
+use screencode::header::{Header, HeaderSpec};
 use screencode::layout::Geometry;
 use screencode::render::render_png;
 use screencode::shard::parse_slot;
@@ -45,17 +45,17 @@ fn full_roundtrip_with_erasure_recovery() {
     let shards = fec::encode_shards(&file, &plan, block).expect("encode");
 
     let geo = Geometry::plan(800, 600, 2, block).expect("geometry");
-    let header = Header::new(
-        geo.module_px,
-        geo.grid_w,
-        geo.grid_h,
-        geo.block_bytes,
-        plan.k,
-        plan.m,
-        plan.total_shards,
-        file.len() as u64,
-        [7u8; 8],
-    );
+    let header = Header::new(HeaderSpec {
+        module_px: geo.module_px,
+        grid_w: geo.grid_w,
+        grid_h: geo.grid_h,
+        block_bytes: geo.block_bytes,
+        k: plan.k,
+        m: plan.m,
+        total_shards: plan.total_shards,
+        file_len: file.len() as u64,
+        hash_prefix: [7u8; 8],
+    });
 
     // 模拟接收端：每个 slot 自描述，所以按 idx 落库即可
     let mut store: Vec<Option<Vec<u8>>> = vec![None; plan.total_shards];
@@ -111,17 +111,17 @@ fn torn_frame_mixes_two_frames_safely() {
     let plan = fec::plan(file.len(), block, 0.10).expect("plan");
     let shards = fec::encode_shards(&file, &plan, block).expect("encode");
     let geo = Geometry::plan(640, 480, 2, block).expect("geometry");
-    let header = Header::new(
-        2,
-        geo.grid_w,
-        geo.grid_h,
-        block,
-        plan.k,
-        plan.m,
-        plan.total_shards,
-        file.len() as u64,
-        [3u8; 8],
-    );
+    let header = Header::new(HeaderSpec {
+        module_px: 2,
+        grid_w: geo.grid_w,
+        grid_h: geo.grid_h,
+        block_bytes: block,
+        k: plan.k,
+        m: plan.m,
+        total_shards: plan.total_shards,
+        file_len: file.len() as u64,
+        hash_prefix: [3u8; 8],
+    });
 
     let mk = |frame: usize| -> Vec<Vec<u8>> {
         let start = frame * geo.slots_per_frame();
@@ -168,17 +168,17 @@ fn offset_capture_still_decodes() {
     let plan = fec::plan(file.len(), block, 0.0).expect("plan");
     let shards = fec::encode_shards(&file, &plan, block).expect("encode");
     let geo = Geometry::plan(640, 480, 2, block).expect("geometry");
-    let header = Header::new(
-        2,
-        geo.grid_w,
-        geo.grid_h,
-        block,
-        plan.k,
-        plan.m,
-        plan.total_shards,
-        file.len() as u64,
-        [0u8; 8],
-    );
+    let header = Header::new(HeaderSpec {
+        module_px: 2,
+        grid_w: geo.grid_w,
+        grid_h: geo.grid_h,
+        block_bytes: block,
+        k: plan.k,
+        m: plan.m,
+        total_shards: plan.total_shards,
+        file_len: file.len() as u64,
+        hash_prefix: [0u8; 8],
+    });
     let frame_slots: Vec<Vec<u8>> = shards[..plan.total_shards.min(geo.slots_per_frame())]
         .iter()
         .enumerate()
@@ -237,17 +237,17 @@ fn scaled_capture_still_decodes() {
     let plan = fec::plan(file.len(), block, 0.0).expect("plan");
     let shards = fec::encode_shards(&file, &plan, block).expect("encode");
     let geo = Geometry::plan(640, 480, 2, block).expect("geometry");
-    let header = Header::new(
-        2,
-        geo.grid_w,
-        geo.grid_h,
-        block,
-        plan.k,
-        plan.m,
-        plan.total_shards,
-        file.len() as u64,
-        [0u8; 8],
-    );
+    let header = Header::new(HeaderSpec {
+        module_px: 2,
+        grid_w: geo.grid_w,
+        grid_h: geo.grid_h,
+        block_bytes: block,
+        k: plan.k,
+        m: plan.m,
+        total_shards: plan.total_shards,
+        file_len: file.len() as u64,
+        hash_prefix: [0u8; 8],
+    });
     let frame_slots: Vec<Vec<u8>> = shards[..plan.total_shards.min(geo.slots_per_frame())]
         .iter()
         .enumerate()

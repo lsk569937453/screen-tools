@@ -7,11 +7,11 @@ edition.workspace = true
 anyhow.workspace = true
 crc32fast.workspace = true
 png.workspace = true
-reed-solomon-erasure = "6"
+reed-solomon-erasure.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-screenshots = "0.7"
-windows-sys = { version = "0.59", features = [
+screenshots.workspace = true
+windows-sys = { version = "=0.59.0", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Storage_Xps",

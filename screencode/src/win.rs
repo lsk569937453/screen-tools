@@ -128,11 +128,14 @@ mod platform {
     const PW_RENDERFULLCONTENT: u32 = 0x0000_0002;
 
     pub fn enable_dpi_awareness() -> bool {
+        // SAFETY: 只设置当前进程的 DPI 感知级别，不传入指针，也不保存任何返回值。
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0 }
     }
 
     pub fn list_windows() -> Result<Vec<WindowInfo>> {
         let mut windows: Vec<WindowInfo> = Vec::new();
+        // SAFETY: `windows` 在整个调用期间存活；回调把 `LPARAM` 还原成同一个 Vec，
+        // 只在该 Vec 上 push，不把借用带出回调。
         let ok = unsafe {
             EnumWindows(
                 Some(enum_windows_cb),
@@ -185,6 +188,8 @@ mod platform {
 
     pub fn locate(handle: isize) -> Option<WindowInfo> {
         let hwnd = handle as HWND;
+        // SAFETY: `hwnd` 来自先前枚举到的窗口句柄；下面全是只读的窗口状态查询，
+        // 输出缓冲区都在栈上，且每个 API 的失败都有显式分支。
         unsafe {
             if IsWindow(hwnd) == 0 {
                 return None;
@@ -211,6 +216,8 @@ mod platform {
 
     pub fn capture_client(handle: isize) -> Result<screenshots::Image> {
         let hwnd = handle as HWND;
+        // SAFETY: `hwnd` 是先前枚举到的窗口句柄；`RECT`/像素缓冲区在栈或本函数内分配，
+        // PrintWindow 只读取窗口内容并写入该缓冲区，失败路径立即返回错误。
         unsafe {
             if IsWindow(hwnd) == 0 {
                 anyhow::bail!("目标窗口已关闭");
@@ -293,6 +300,10 @@ mod platform {
         }
     }
 
+    /// # Safety
+    ///
+    /// 只由 `EnumWindows` 调用；`lparam` 必须是 `list_windows` 传入的
+    /// `*mut Vec<WindowInfo>`，并在回调期间保持有效。
     unsafe extern "system" fn enum_windows_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let out = &mut *(lparam as *mut Vec<WindowInfo>);
 
@@ -324,12 +335,19 @@ mod platform {
         TRUE
     }
 
+    /// # Safety
+    ///
+    /// `hwnd` 必须是有效窗口句柄；无效句柄只会让 `GetWindowThreadProcessId` 写入 0。
     unsafe fn window_pid(hwnd: HWND) -> u32 {
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut pid);
         pid
     }
 
+    /// # Safety
+    ///
+    /// `hwnd` 必须是有效窗口句柄；长度来自 `GetWindowTextLengthW`，
+    /// 缓冲区按该长度分配，并用返回值截断。
     unsafe fn window_title(hwnd: HWND) -> String {
         let len = GetWindowTextLengthW(hwnd);
         if len <= 0 {
@@ -346,6 +364,10 @@ mod platform {
             .into_owned()
     }
 
+    /// # Safety
+    ///
+    /// `pid` 可以是任意进程号：权限不足或进程不存在时 `OpenProcess` 返回空句柄，
+    /// 本函数会提前返回空字符串，不会解引用空句柄。
     unsafe fn process_name(pid: u32) -> String {
         if pid == 0 {
             return String::new();
@@ -371,6 +393,10 @@ mod platform {
         }
     }
 
+    /// # Safety
+    ///
+    /// `hwnd` 必须是有效窗口句柄；客户区尺寸通过 `GetClientRect` 获取，
+    /// 分配失败或尺寸为 0 时返回 `None`。
     unsafe fn client_frame(hwnd: HWND) -> Option<Frame> {
         let mut rect = RECT {
             left: 0,

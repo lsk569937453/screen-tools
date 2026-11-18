@@ -83,8 +83,8 @@ pub fn data_row_starts(geo: &Geometry) -> Vec<usize> {
     let b = BORDER_MODULES as usize;
     let mut starts = vec![0usize; gh + 1];
     let mut acc = 0usize;
-    for y in 0..gh {
-        starts[y] = acc;
+    for (y, start) in starts.iter_mut().enumerate().take(gh) {
+        *start = acc;
         // 上下边框行没有数据位
         if y < b || y >= gh.saturating_sub(b) {
             continue;
@@ -133,8 +133,8 @@ fn module_dark(
         return true;
     }
     if geo.is_header(x32, y32) {
-        let hx = (x - B as usize) as usize;
-        let hy = (y - B as usize) as usize;
+        let hx = x - B as usize;
+        let hy = y - B as usize;
         return bit_at(header_bytes, hy * HEADER_W as usize + hx);
     }
     let idx = data_index(row_start, x, y);
@@ -180,19 +180,20 @@ pub fn check_slots(geo: &Geometry, slots: &[Vec<u8>]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::header::HeaderSpec;
 
     fn sample_header(geo: &Geometry) -> Header {
-        Header::new(
-            geo.module_px,
-            geo.grid_w,
-            geo.grid_h,
-            geo.block_bytes,
-            10,
-            2,
-            12,
-            40_000,
-            [9u8; 8],
-        )
+        Header::new(HeaderSpec {
+            module_px: geo.module_px,
+            grid_w: geo.grid_w,
+            grid_h: geo.grid_h,
+            block_bytes: geo.block_bytes,
+            k: 10,
+            m: 2,
+            total_shards: 12,
+            file_len: 40_000,
+            hash_prefix: [9u8; 8],
+        })
     }
 
     fn decode_png(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
@@ -226,7 +227,7 @@ mod tests {
         assert_eq!(bit(geo.code_x() as usize, geo.code_y() as usize), 0);
         // 模块 (1,3) 仍是边框（厚度 2）
         assert_eq!(
-            bit(geo.code_x() as usize + 1 * 2, geo.code_y() as usize + 3 * 2),
+            bit(geo.code_x() as usize + 2, geo.code_y() as usize + 3 * 2),
             0
         );
         // 边框内侧数据区第一格不是整块黑（随机数据下大概率）

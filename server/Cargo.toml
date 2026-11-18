@@ -5,11 +5,14 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
+common = { path = "../common" }
+hex.workspace = true
+screencode = { path = "../screencode" }
+screenshots.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-screencode = { path = "../screencode" }
-screenshots = "0.7"
+tracing.workspace = true
 
 [dev-dependencies]
-png = "0.17"
+png.workspace = true

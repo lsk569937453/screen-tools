@@ -53,7 +53,7 @@ pub fn plan(file_len: usize, block_bytes: usize, parity: f64) -> Result<FecPlan>
     }
 
     let data_blocks = file_len.div_ceil(block_bytes);
-    let k = data_blocks.min(K_MAX).max(1);
+    let k = data_blocks.clamp(1, K_MAX);
     let mut m = if parity > 0.0 {
         ((k as f64) * parity).round() as usize
     } else {
@@ -105,7 +105,7 @@ pub fn plan_from_header(header: &Header) -> Option<FecPlan> {
     let m = header.m as usize;
     let total_shards = header.total_shards as usize;
     let per = k + m;
-    if per == 0 || total_shards % per != 0 {
+    if per == 0 || !total_shards.is_multiple_of(per) {
         return None;
     }
     let groups = total_shards / per;
@@ -150,8 +150,8 @@ pub fn assemble(shards: &[Option<Vec<u8>>], header: &Header) -> Result<Vec<u8>, 
                 .map_err(|_| AssembleError::Reconstruct { group })?;
         }
 
-        for local in 0..plan.k {
-            data_blocks.push(group_shards[local].take().unwrap_or_default());
+        for shard in group_shards.iter_mut().take(plan.k) {
+            data_blocks.push(shard.take().unwrap_or_default());
         }
     }
 
@@ -204,6 +204,7 @@ impl std::error::Error for AssembleError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::header::HeaderSpec;
 
     fn sample_file(len: usize) -> Vec<u8> {
         let mut state = 0x1234_5678_9abc_def0u64;
@@ -218,17 +219,17 @@ mod tests {
     }
 
     fn header_for(file_len: usize, plan: &FecPlan, block_bytes: usize) -> Header {
-        Header::new(
-            2,
-            1244,
-            656,
+        Header::new(HeaderSpec {
+            module_px: 2,
+            grid_w: 1244,
+            grid_h: 656,
             block_bytes,
-            plan.k,
-            plan.m,
-            plan.total_shards,
-            file_len as u64,
-            [0u8; 8],
-        )
+            k: plan.k,
+            m: plan.m,
+            total_shards: plan.total_shards,
+            file_len: file_len as u64,
+            hash_prefix: [0u8; 8],
+        })
     }
 
     #[test]
