@@ -1,21 +1,23 @@
 target
 .claude
-.qr_session.json
-
-# IDE 的本地工作区状态
 .openidea/
 
-# 本地基准脚本（二维码编码容量对比等），不进仓库
-.bench/
+# 接收端分片库
+.qr_blocks.bin
+.qr_state.json
+.qr_state.json.tmp
+.qr_session.json
 
-# 接收端落盘的产物：收到的文件与解压出来的目录
+# 本地基准/调试脚本与临时目录
+.bench/
+tmp-e2e/
+tmp-qr/
+
+# 接收端落盘的产物
 received_file_*
 server/received_file_*
 
-# 发送端生成的二维码与本地调试临时目录
+# 发送端导出的帧与本地调试临时目录
 qr_output/
-tmp-qr/
-
-# 接收端日志（logs/server-<时间戳>.log）
 logs/
 server/logs/

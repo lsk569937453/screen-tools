@@ -1,0 +1,24 @@
+[package]
+name = "screencode"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crc32fast.workspace = true
+png.workspace = true
+reed-solomon-erasure = "6"
+
+[target.'cfg(windows)'.dependencies]
+screenshots = "0.7"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+sha2.workspace = true

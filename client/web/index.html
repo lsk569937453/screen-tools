@@ -3,7 +3,7 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>QR码文件传输 - 轮播播放</title>
+        <title>ScreenCode 播放</title>
         <style>
             * {
                 margin: 0;
@@ -11,993 +11,371 @@
                 box-sizing: border-box;
             }
 
+            html,
             body {
-                font-family: "Consolas", "Monaco", monospace;
-                background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-                min-height: 100vh;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                padding: 16px;
-            }
-
-            /* 播放模式：去掉一切装饰，把屏幕全部让给二维码 */
-            body.playing {
-                padding: 0;
-                background: #0f172a;
-                justify-content: stretch;
-            }
-
-            .container {
-                background: white;
-                border-radius: 20px;
-                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-                padding: 18px;
-                max-width: 1100px;
-                width: 100%;
-                /* 撑满可视高度并靠 flex 分配，避免内容把按钮挤出屏幕 */
-                height: calc(100vh - 32px);
-                display: flex;
-                flex-direction: column;
-                text-align: center;
-            }
-
-            body.playing .container {
-                max-width: none;
-                width: 100vw;
-                height: 100vh;
-                border-radius: 0;
-                padding: 8px;
-                box-shadow: none;
-            }
-
-            .header {
-                flex: 0 0 auto;
-                border: 3px solid #1e3c72;
-                border-radius: 10px;
-                padding: 12px;
-                margin-bottom: 8px;
-                background: #f8f9fa;
-            }
-
-            .header h1 {
-                color: #1e3c72;
-                font-size: 20px;
-                margin-bottom: 6px;
-            }
-
-            .stats {
-                display: flex;
-                justify-content: space-around;
-                margin-top: 6px;
-                color: #555;
-                font-size: 13px;
-                gap: 8px;
-            }
-
-            .stat-item {
-                display: flex;
-                flex-direction: column;
-                gap: 4px;
-                min-width: 72px;
-            }
-
-            .stat-value {
-                font-size: 20px;
-                font-weight: bold;
-                color: #1e3c72;
-            }
-
-            /* 二维码宫格：最多 6 张，行列由 --cols/--rows 控制 */
-            .qr-grid {
-                --cols: 3;
-                --rows: 2;
-                display: grid;
-                /* 用 minmax(0, 1fr) 而不是 1fr：1fr 的下限是 auto，
-                   内容（二维码）会把行撑破，压到下面的控件上 */
-                grid-template-columns: repeat(var(--cols), minmax(0, 1fr));
-                grid-template-rows: repeat(var(--rows), minmax(0, 1fr));
-                gap: 8px;
-                width: 100%;
-                flex: 1 1 auto;
-                min-height: 0;
-                overflow: hidden;
-                margin: 8px 0;
-            }
-
-            body.playing .qr-grid {
-                margin: 0;
-                gap: 6px;
-                /* 播放时隐藏鼠标指针：指针压在二维码上会直接让那一张解不出来 */
-                cursor: none;
-            }
-
-            body.playing .qr-slot {
-                cursor: none;
-            }
-
-            .qr-slot {
                 width: 100%;
                 height: 100%;
-                object-fit: contain;
+                overflow: hidden;
                 background: #ffffff;
-                border-radius: 4px;
-                display: none;
-                /* 尺寸由 fitSlots() 按"整数倍模块"算出来；自动模式封顶在 SVG 原尺寸，居中摆放、不放大 */
-                justify-self: center;
-                align-self: center;
             }
 
-            /* 高亮描边画在图片外侧，绝不遮挡二维码模块 */
-            .qr-slot.focused {
-                outline: 4px solid #f59e0b;
-                outline-offset: 2px;
+            body {
+                font-family: "Consolas", "Monaco", monospace;
+                color: #111;
             }
 
-            .data-preview {
-                flex: 0 0 auto;
-                background: #f8f9fa;
-                border: 2px solid #dee2e6;
-                border-radius: 8px;
-                padding: 10px;
-                margin-top: 8px;
-                font-size: 12px;
-                color: #666;
-                word-break: break-all;
-                max-height: 64px;
-                overflow-y: auto;
+            /* 播放区：整张图按设备像素 1:1 放在左上角 */
+            #stage {
+                position: fixed;
+                left: 0;
+                top: 0;
+                width: 100%;
+                height: 100%;
+                background: #ffffff;
             }
 
-            /* 出错时把提示区域撑开，避免关键信息被 max-height 截断 */
-            .data-preview.expanded {
-                flex: 1 1 auto;
-                max-height: none;
-                overflow: visible;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                background: #fff5f5;
-                border-color: #f5c6cb;
+            .layer {
+                position: absolute;
+                left: 0;
+                top: 0;
+                display: block;
+                image-rendering: pixelated;
+                image-rendering: crisp-edges;
+                background: #ffffff;
+                visibility: hidden;
             }
 
-            /* 没有二维码时不显示空宫格，把空间留给提示 */
-            .qr-grid.empty {
+            body.playing {
+                cursor: none;
+            }
+
+            body.playing .layer {
+                cursor: none;
+            }
+
+            /* 面板只在播放前显示，播放时彻底隐藏，绝不压在码上 */
+            body.playing #panel {
                 display: none;
             }
 
-            .controls {
-                flex: 0 0 auto;
-                display: flex;
-                gap: 10px;
-                margin-top: 10px;
-                justify-content: center;
-                flex-wrap: wrap;
-            }
-
-            body.playing .controls {
-                margin-top: 6px;
-                flex: 0 0 auto;
-            }
-
-            body.playing .controls button {
-                padding: 6px 14px;
+            #panel {
+                position: fixed;
+                left: 16px;
+                top: 16px;
+                right: 16px;
+                max-width: 560px;
+                padding: 16px 18px;
+                border-radius: 10px;
+                background: rgba(17, 24, 39, 0.92);
+                color: #f9fafb;
                 font-size: 13px;
+                line-height: 1.6;
+                box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+            }
+
+            #panel h1 {
+                font-size: 16px;
+                margin-bottom: 6px;
+                letter-spacing: 0.5px;
+            }
+
+            #panel .meta {
+                color: #9ca3af;
+                white-space: pre-wrap;
+            }
+
+            #panel .error {
+                color: #fca5a5;
+            }
+
+            #panel .row {
+                display: flex;
+                gap: 8px;
+                align-items: center;
+                margin-top: 10px;
+                flex-wrap: wrap;
             }
 
             button {
-                padding: 10px 20px;
-                font-size: 16px;
-                border: none;
-                border-radius: 8px;
+                font: inherit;
+                padding: 7px 14px;
+                border: 0;
+                border-radius: 6px;
                 cursor: pointer;
-                transition: all 0.3s ease;
-                font-family: inherit;
+                background: #2563eb;
+                color: #fff;
             }
 
-            button:disabled {
-                opacity: 0.5;
-                cursor: not-allowed;
+            button.ghost {
+                background: #374151;
             }
 
-            .btn-primary {
-                background: #1e3c72;
-                color: white;
-            }
-
-            .btn-primary:hover:not(:disabled) {
-                background: #2a5298;
-                transform: translateY(-2px);
-                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-            }
-
-            .btn-secondary {
-                background: #6c757d;
-                color: white;
-            }
-
-            .btn-secondary:hover:not(:disabled) {
-                background: #5a6268;
-            }
-
-            /* 按钮显隐完全由 body.playing 驱动 */
-            #play-pause,
-            #restart,
-            #exit-play {
-                display: none;
-            }
-
-            body.playing #start-play {
-                display: none;
-            }
-
-            body.playing #play-pause,
-            body.playing #restart,
-            body.playing #exit-play {
-                display: inline-block;
-            }
-
-            body.playing .header,
-            body.playing .data-preview,
-            body.playing .progress,
-            body.playing .jump-control {
-                display: none;
-            }
-
-            .jump-control {
-                flex: 0 0 auto;
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                margin-top: 10px;
-                justify-content: center;
-                flex-wrap: wrap;
-            }
-
-            .jump-input {
-                width: 100px;
-                padding: 8px 12px;
-                font-size: 16px;
-                border: 2px solid #1e3c72;
-                border-radius: 8px;
-                text-align: center;
-                font-family: inherit;
-            }
-
-            .jump-input:focus,
-            .page-size-select:focus {
-                outline: none;
-                border-color: #2a5298;
-                box-shadow: 0 0 0 3px rgba(30, 60, 114, 0.1);
-            }
-
-            .page-size-select {
-                padding: 8px 12px;
-                font-size: 15px;
-                border: 2px solid #1e3c72;
-                border-radius: 8px;
-                font-family: inherit;
-                background: #fff;
-                cursor: pointer;
-            }
-
-            .hint {
-                width: 100%;
+            #hud {
+                position: fixed;
+                right: 12px;
+                bottom: 10px;
                 font-size: 12px;
-                color: #888;
-                margin-top: 4px;
+                color: #9ca3af;
+                display: none;
             }
 
-            .loop-toggle {
-                display: inline-flex;
-                align-items: center;
-                gap: 6px;
-                font-size: 14px;
-                color: #444;
-                cursor: pointer;
-                user-select: none;
-            }
-
-            .loop-toggle input {
-                width: 16px;
-                height: 16px;
-                cursor: pointer;
-            }
-
-            /* 播放态也保留的小字：当前一屏实际放了几张 */
-            .page-info {
-                align-self: center;
-                font-size: 13px;
-                color: #64748b;
-                white-space: nowrap;
-            }
-
-            .progress {
-                flex: 0 0 auto;
-                width: 100%;
-                height: 6px;
-                background: #e9ecef;
-                border-radius: 3px;
-                margin-top: 10px;
-                overflow: hidden;
-            }
-
-            .progress-bar {
-                height: 100%;
-                background: linear-gradient(90deg, #1e3c72, #2a5298);
-                transition: width 0.3s ease;
-            }
-
-            @keyframes pulse {
-                0%,
-                100% {
-                    opacity: 1;
-                }
-                50% {
-                    opacity: 0.7;
-                }
-            }
-
-            .status-playing {
-                color: #28a745;
-                animation: pulse 1s infinite;
-            }
-
-            .error {
-                background: #f8d7da;
-                border: 2px solid #f5c6cb;
-                color: #721c24;
-                padding: 20px;
-                border-radius: 10px;
-                margin: 20px 0;
+            body.debug #hud {
+                display: block;
             }
         </style>
     </head>
     <body>
-        <div class="container">
-            <div class="header">
-                <h1>📱 QR码文件传输</h1>
-                <div class="stats">
-                    <div class="stat-item">
-                        <span class="stat-value" id="current">-</span>
-                        <span>当前片段</span>
-                    </div>
-                    <div class="stat-item">
-                        <span class="stat-value" id="total">-</span>
-                        <span>总数</span>
-                    </div>
-                    <div class="stat-item">
-                        <span class="stat-value" id="page">-</span>
-                        <span>页码</span>
-                    </div>
-                    <div class="stat-item">
-                        <span class="stat-value" id="status">⏳</span>
-                        <span id="status-text">加载中</span>
-                    </div>
-                </div>
-            </div>
+        <div id="stage">
+            <img id="layerA" class="layer" alt="ScreenCode" />
+            <img id="layerB" class="layer" alt="ScreenCode" />
+        </div>
 
-            <!-- 最多 6 个槽位，由脚本按每屏张数显示/隐藏 -->
-            <div class="qr-grid" id="qr-grid"></div>
-
-            <div class="data-preview" id="data-preview">加载中...</div>
-
-            <div class="progress">
-                <div
-                    class="progress-bar"
-                    id="progress-bar"
-                    style="width: 0%"
-                ></div>
-            </div>
-
-            <div class="controls">
-                <button
-                    class="btn-primary"
-                    id="start-play"
-                    onclick="startPlayClick()"
-                    disabled
-                >
-                    开始播放
-                </button>
-                <button class="btn-primary" id="play-pause" onclick="togglePlay()">
-                    暂停
-                </button>
-                <button class="btn-secondary" id="restart" onclick="restart()">
-                    重新开始
-                </button>
-                <button class="btn-secondary" id="exit-play" onclick="exitPlayMode()">
-                    退出播放
-                </button>
-                <button class="btn-secondary" id="fullscreen" onclick="toggleFullscreen()">
-                    全屏
-                </button>
-                <label class="loop-toggle" for="loop-play">
-                    <input type="checkbox" id="loop-play" />
-                    循环播放
-                </label>
-                <span class="page-info" id="page-info"></span>
-            </div>
-
-            <div class="jump-control">
-                <label for="jump-input">跳转到片段:</label>
-                <input
-                    type="number"
-                    id="jump-input"
-                    class="jump-input"
-                    min="1"
-                    max="9999"
-                    placeholder="序号"
-                    onkeypress="handleJumpKeypress(event)"
-                />
-                <button class="btn-primary" onclick="jumpToQr()">跳转</button>
-
-                <label for="per-page">每屏张数:</label>
-                <select id="per-page" class="page-size-select">
-                    <option value="auto" selected>自动（原尺寸铺满）</option>
-                    <option value="1">1 张（放大铺满）</option>
-                    <option value="2">2 张（放大铺满）</option>
-                    <option value="3">3 张（放大铺满）</option>
-                    <option value="4">4 张（放大铺满）</option>
-                    <option value="6">6 张（放大铺满）</option>
-                </select>
-                <span class="hint" id="layout-hint">
-                    自动模式按 SVG 原始尺寸铺满当前窗口，窗口越大一屏张数越多；
-                    手动张数会把二维码放大铺满格子。
-                </span>
+        <div id="panel">
+            <h1>ScreenCode 单图播放</h1>
+            <div class="meta" id="meta">正在连接服务器…</div>
+            <div class="row">
+                <button id="start">开始播放</button>
+                <button id="pause" class="ghost" disabled>暂停</button>
+                <button id="step" class="ghost" disabled>下一帧</button>
             </div>
         </div>
 
+        <div id="hud"></div>
+
         <script>
-            const SLIDE_INTERVAL_MS = 1000; // 每屏停留时间（毫秒）
-            // 自动模式下单屏张数上限：再多只会增加 DOM 与接收端每帧解码压力
-            const MAX_AUTO_PER_PAGE = 24;
-            // 手动"放大铺满"模式的预设：每屏张数 -> [列, 行]
-            const GRID_PRESETS = {
-                1: [1, 1],
-                2: [2, 1],
-                3: [3, 1],
-                4: [2, 2],
-                6: [3, 2],
-            };
-            // 2000 字符分片（EC level M）固定是 version 39：173 个数据模块 + 两侧各 4 个静区模块
-            const DEFAULT_QR_MODULES = 181;
-            // SVG 固有边长：max_dimensions(400) 下每模块 2px
-            const DEFAULT_QR_SIDE = 362;
-            const PRESET_HINT =
-                "每屏张数越多传输越快，但单个二维码越小、越难识别；" +
-                "自动模式按原尺寸铺满，手动张数会把二维码放大铺满格子。";
-
-            let totalQr = 0;
-            let perPage = 6;
-            let pageIndex = 0;
-            let isPlaying = false;
-            let interval = null;
-            let hasStarted = false;
-            let focusSeq = null;
-            let pageSizeMode = "auto"; // "auto" = 原尺寸铺满；否则为手动预设张数
-            let gridCols = 1; // 当前实际列数
-            let gridRows = 1; // 当前实际行数
-            let lastSlotCssSize = DEFAULT_QR_SIDE; // 最近一次吸附后的单张边长（CSS px）
-
-            const qrGrid = document.getElementById("qr-grid");
-            const currentSpan = document.getElementById("current");
-            const totalSpan = document.getElementById("total");
-            const pageSpan = document.getElementById("page");
-            const statusSpan = document.getElementById("status");
-            const statusText = document.getElementById("status-text");
-            const progressBar = document.getElementById("progress-bar");
-            const startPlayBtn = document.getElementById("start-play");
-            const playPauseBtn = document.getElementById("play-pause");
-            const dataPreview = document.getElementById("data-preview");
-            const perPageSelect = document.getElementById("per-page");
-            const layoutHint = document.getElementById("layout-hint");
-            const pageInfo = document.getElementById("page-info");
-
-            // 槽位池：按当前每屏张数按需创建，不预先写死数量
-            const slots = [];
-
-            function ensureSlots(count) {
-                while (slots.length < count) {
-                    const img = document.createElement("img");
-                    img.className = "qr-slot";
-                    img.alt = "QR Code";
-                    qrGrid.appendChild(img);
-                    slots.push(img);
+            (() => {
+                const params = new URLSearchParams(location.search);
+                const debug = params.has("debug");
+                if (debug) {
+                    document.body.classList.add("debug");
                 }
-            }
 
-            // ── 二维码显示尺寸：必须按"整数倍模块"渲染 ──────────────────────
-            // client 生成的 SVG 带 shape-rendering="crispEdges"，浏览器会关掉抗锯齿，
-            // 把每个模块的边界直接对齐到设备像素。只要"每模块占几个像素"不是整数，
-            // 模块宽度就会变成 2/3 像素交替，定位图案和时序图案跟着变形，
-            // 接收端 rqrr 会连网格都定位不到（实测 445px 宽时 0 命中，原生 2px/模块时一次成功）。
-            // 所以这里把显示尺寸吸附成 "n × 模块数" 个设备像素，n 取能放下的最大整数；
-            // 自动模式再把 n 封顶在 SVG 固有时每模块的像素数上，即"绝不放大"。
-            let qrModules = DEFAULT_QR_MODULES; // 每边模块数（含两侧各 4 个静区模块）
-            let qrNaturalSide = DEFAULT_QR_SIDE; // SVG 固有边长（CSS px）
-            let qrProbed = false;
+                const layers = [
+                    document.getElementById("layerA"),
+                    document.getElementById("layerB"),
+                ];
+                const meta = document.getElementById("meta");
+                const startBtn = document.getElementById("start");
+                const pauseBtn = document.getElementById("pause");
+                const stepBtn = document.getElementById("step");
+                const hud = document.getElementById("hud");
 
-            // 量一次 SVG 的模块几何：静区固定 4 个模块，所以第一个黑像素的 x 坐标 = 4 × 模块像素
-            function probeQrGeometry(img) {
-                if (qrProbed || !img) {
-                    return;
-                }
-                qrProbed = true;
-
-                const measure = () => {
-                    try {
-                        const w = img.naturalWidth;
-                        const h = img.naturalHeight;
-                        if (!w || !h) {
-                            throw new Error("SVG 缺少自然尺寸");
-                        }
-
-                        const canvas = document.createElement("canvas");
-                        canvas.width = w;
-                        canvas.height = h;
-                        const ctx = canvas.getContext("2d", { willReadFrequently: true });
-                        ctx.drawImage(img, 0, 0, w, h);
-                        const { data } = ctx.getImageData(0, 0, w, h);
-
-                        let left = w;
-                        for (let y = 0; y < h && left > 0; y++) {
-                            for (let x = 0; x < left; x++) {
-                                const i = (y * w + x) * 4;
-                                const luma =
-                                    (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000;
-                                if (luma < 128) {
-                                    left = x;
-                                    break;
-                                }
-                            }
-                        }
-
-                        const unit = left / 4; // 一个模块占多少 SVG 像素
-                        if (unit > 0 && Number.isInteger(unit) && w % unit === 0) {
-                            qrModules = w / unit;
-                        }
-                        qrNaturalSide = w;
-                    } catch (error) {
-                        console.warn("二维码几何测量失败，回退 181 模块 / 362px", error);
-                    }
-                    relayout();
-                };
-
-                if (img.complete && img.naturalWidth) {
-                    measure();
-                } else {
-                    img.addEventListener("load", measure, { once: true });
-                }
-            }
-
-            function isAutoMode() {
-                return pageSizeMode === "auto";
-            }
-
-            // 自动模式单张边长的上限（设备像素/模块）：等于 SVG 固有密度，不做放大
-            function intrinsicModuleCap(dpr) {
-                return Math.max(1, Math.floor((qrNaturalSide * dpr) / qrModules + 1e-6));
-            }
-
-            // 当前区域按"原尺寸"能放下多少张：先减行再减列，保证每张尺寸不缩水
-            function computeAutoGrid(availW, availH, gap, side) {
-                if (availW <= 0 || availH <= 0) {
-                    return [1, 1];
-                }
-                let cols = Math.max(1, Math.floor((availW + gap) / (side + gap)));
-                let rows = Math.max(1, Math.floor((availH + gap) / (side + gap)));
-                while (cols * rows > MAX_AUTO_PER_PAGE) {
-                    if (rows > 1) {
-                        rows -= 1;
-                    } else if (cols > 1) {
-                        cols -= 1;
-                    } else {
-                        break;
-                    }
-                }
-                return [cols, rows];
-            }
-
-            // 计算本屏行列：自动模式按原尺寸算，手动模式用固定预设
-            function resolveGrid() {
-                const gap = parseFloat(getComputedStyle(qrGrid).columnGap) || 0;
-                let cols;
-                let rows;
-                if (isAutoMode()) {
-                    [cols, rows] = computeAutoGrid(
-                        qrGrid.clientWidth,
-                        qrGrid.clientHeight,
-                        gap,
-                        qrNaturalSide
-                    );
-                    perPage = cols * rows;
-                } else {
-                    [cols, rows] = GRID_PRESETS[pageSizeMode] || GRID_PRESETS[6];
-                    perPage = parseInt(pageSizeMode, 10) || 6;
-                }
-                gridCols = cols;
-                gridRows = rows;
-                qrGrid.style.setProperty("--cols", cols);
-                qrGrid.style.setProperty("--rows", rows);
-                ensureSlots(perPage);
-            }
-
-            // 把槽位尺寸吸附到整数倍模块：自动模式 n 封顶在固有密度，绝不放大
-            function fitSlots() {
-                if (!qrModules || !qrGrid.clientWidth) {
-                    return;
-                }
-                const gap = parseFloat(getComputedStyle(qrGrid).columnGap) || 0;
-                const cols = gridCols || 1;
-                const rows = gridRows || 1;
-                const cellW = (qrGrid.clientWidth - gap * (cols - 1)) / cols;
-                const cellH = (qrGrid.clientHeight - gap * (rows - 1)) / rows;
-                if (cellW <= 0 || cellH <= 0) {
-                    return;
-                }
+                let info = null;
+                let count = 0;
+                let dwell = 300;
+                let current = 1; // 当前显示的帧号（1 基）
+                let front = 0; // 当前可见的 layer 下标
+                let timer = null;
+                let playing = false;
+                let busy = false;
+                let sizeWarned = false;
+                let failures = 0;
 
                 const dpr = window.devicePixelRatio || 1;
-                const fitting = Math.floor(Math.min(cellW * dpr, cellH * dpr) / qrModules);
-                // 自动模式不允许放大：上限就是 SVG 固有时每模块的设备像素数
-                const n = Math.max(
-                    1,
-                    isAutoMode() ? Math.min(fitting, intrinsicModuleCap(dpr)) : fitting
-                );
-                const cssSize = (n * qrModules) / dpr;
-                lastSlotCssSize = cssSize;
-                slots.forEach((slot) => {
-                    slot.style.width = `${cssSize}px`;
-                    slot.style.height = `${cssSize}px`;
-                });
-                if (n < 2) {
-                    // 每模块只剩 1 像素时 rqrr 连定位图案都拼不出来，准备阶段就把话说清楚
-                    console.warn(
-                        `每模块只有 ${n} 像素，接收端可能识别不了：请全屏，或改用手动 1~2 张`
-                    );
-                    if (!document.body.classList.contains("playing")) {
-                        statusSpan.textContent = "⚠️";
-                        statusText.textContent = "窗口偏小，请全屏或减少每屏张数";
-                    }
-                } else if (
-                    !document.body.classList.contains("playing") &&
-                    statusText.textContent.startsWith("窗口偏小")
-                ) {
-                    statusSpan.textContent = "▶️";
-                    statusText.textContent = "准备就绪";
-                }
-            }
 
-            function updateLayoutHint() {
-                if (!layoutHint) {
-                    return;
-                }
-                if (isAutoMode()) {
-                    layoutHint.textContent =
-                        `自动：按原尺寸铺满 · 本屏 ${gridCols}×${gridRows} = ${perPage} 张` +
-                        ` · 单张 ${Math.round(lastSlotCssSize)}px`;
-                } else {
-                    layoutHint.textContent = PRESET_HINT;
-                }
-            }
-
-            // 布局入口：窗口/全屏/张数/探测变化后统一重算，并让首片段仍留在屏上
-            function relayout() {
-                // 没有可用二维码（加载中 / 出错）时不动显示区，避免覆盖错误提示
-                if (!totalQr) {
-                    return;
-                }
-                const anchor = pageIndex * perPage + 1;
-                resolveGrid();
-                fitSlots();
-                pageIndex = Math.max(0, Math.floor((anchor - 1) / perPage));
-                if (pageIndex >= pageCount()) {
-                    pageIndex = Math.max(0, pageCount() - 1);
-                }
-                updateDisplay();
-                updateLayoutHint();
-            }
-
-            let relayoutQueued = false;
-
-            function queueRelayout() {
-                if (relayoutQueued) {
-                    return;
-                }
-                relayoutQueued = true;
-                requestAnimationFrame(() => {
-                    relayoutQueued = false;
-                    relayout();
-                });
-            }
-
-            // 窗口尺寸 / 全屏状态变化后重新计算张数与尺寸
-            window.addEventListener("resize", queueRelayout);
-            document.addEventListener("fullscreenchange", queueRelayout);
-
-            function pad3(n) {
-                return String(n).padStart(3, "0");
-            }
-
-            function qrUrl(seq) {
-                return `qr_output/qr_${pad3(seq)}.svg`;
-            }
-
-            function pageCount() {
-                return Math.max(1, Math.ceil(totalQr / perPage));
-            }
-
-            function pageStart(page) {
-                return page * perPage;
-            }
-
-            function normalizePageSizeMode(value) {
-                if (value === "auto") {
-                    return "auto";
-                }
-                const n = parseInt(value, 10);
-                return GRID_PRESETS[n] ? n : 6;
-            }
-
-            // 渲染当前屏：显示 start+1 .. end 片段
-            function updateDisplay() {
-                const start = pageStart(pageIndex);
-                const end = Math.min(start + perPage, totalQr);
-
-                slots.forEach((slot, i) => {
-                    const seq = start + i + 1;
-                    if (seq <= end) {
-                        const url = qrUrl(seq);
-                        if (slot.getAttribute("src") !== url) {
-                            slot.src = url;
-                        }
-                        slot.style.display = "block";
-                        slot.classList.toggle("focused", focusSeq === seq);
-                    } else {
-                        slot.style.display = "none";
-                        slot.classList.remove("focused");
-                    }
-                });
-
-                const shown = Math.max(0, end - start);
-                currentSpan.textContent = shown > 0 ? `${start + 1}–${end}` : "-";
-                totalSpan.textContent = totalQr;
-                pageSpan.textContent = `${pageIndex + 1}/${pageCount()}`;
-                progressBar.style.width = `${totalQr ? (end / totalQr) * 100 : 0}%`;
-                dataPreview.textContent =
-                    shown > 0
-                        ? `本屏 ${shown} 张: qr_${pad3(start + 1)}.svg … qr_${pad3(end)}.svg`
-                        : "没有可显示的二维码";
-                if (pageInfo) {
-                    pageInfo.textContent = shown > 0 ? `本屏 ${shown} 张` : "";
-                }
-            }
-
-            // 从 API 获取二维码信息
-            async function loadQrInfo() {
-                // 直接双击打开 index.html（file://）时没有后端，直接给提示
-                if (window.location.protocol === "file:") {
-                    showError(
-                        "请不要直接打开 html 文件。先运行 client（不带参数）启动服务，" +
-                            "再访问 http://localhost:9090/"
-                    );
-                    return;
+                function frameUrl(n) {
+                    return `/api/frame/${n}`;
                 }
 
-                try {
-                    const response = await fetch("/api/info");
-                    const data = await response.json();
-
-                    if (data.error) {
-                        showError(data.error);
+                function resizeLayer(img) {
+                    if (!img.naturalWidth || !img.naturalHeight) {
                         return;
                     }
+                    // PNG 是设备像素；CSS 用 px / dpr 才能 1:1
+                    const w = img.naturalWidth / dpr;
+                    const h = img.naturalHeight / dpr;
+                    img.style.width = `${w}px`;
+                    img.style.height = `${h}px`;
 
-                    totalQr = data.total;
-                    totalSpan.textContent = totalQr;
-                    document.getElementById("jump-input").max = totalQr;
-
-                    if (totalQr === 0) {
-                        showError(
-                            "未找到二维码文件，请先执行 <code>client &lt;文件路径&gt;</code> 生成。" +
-                                `<br>服务正在查找目录：<code>${data.dir || "qr_output"}</code>` +
-                                "<br>（该目录相对于启动 client 时的工作目录）"
+                    if (!sizeWarned && (w > window.innerWidth + 0.5 || h > window.innerHeight + 0.5)) {
+                        sizeWarned = true;
+                        console.warn(
+                            `图片 ${img.naturalWidth}x${img.naturalHeight} 大于视口 ` +
+                                `${Math.round(window.innerWidth * dpr)}x${Math.round(window.innerHeight * dpr)}，` +
+                                `右侧/底部会被裁掉；请用 client --probe 取尺寸后重新生成`
                         );
+                    }
+                }
+
+                // 把第 n 帧加载进指定 layer（同一个 layer 已经加载过同一帧就跳过，避免重复请求/onload 不触发）
+                async function loadInto(layer, n) {
+                    if (
+                        layer.dataset.frame === String(n) &&
+                        layer.complete &&
+                        layer.naturalWidth > 0
+                    ) {
+                        return;
+                    }
+                    await new Promise((resolve, reject) => {
+                        layer.onload = () => resolve();
+                        layer.onerror = () => reject(new Error(`第 ${n} 帧加载失败`));
+                        layer.dataset.frame = String(n);
+                        layer.src = frameUrl(n);
+                    });
+                }
+
+                async function present(n) {
+                    if (busy || !count) {
+                        return;
+                    }
+                    busy = true;
+                    try {
+                        const back = layers[1 - front];
+                        await loadInto(back, n);
+                        resizeLayer(back);
+                        const old = layers[front];
+                        back.style.visibility = "visible";
+                        old.style.visibility = "hidden";
+                        front = 1 - front;
+                        current = n;
+                        failures = 0;
+                        updateHud();
+                    } catch (error) {
+                        failures += 1;
+                        if (failures <= 3) {
+                            console.warn(error);
+                        }
+                    } finally {
+                        busy = false;
+                    }
+                }
+
+                // 预热下一帧：加载进当前隐藏的 layer，下一拍直接交换
+                function preloadNext() {
+                    if (!count) {
+                        return;
+                    }
+                    const next = (current % count) + 1;
+                    loadInto(layers[1 - front], next).catch(() => {});
+                }
+
+                function updateHud() {
+                    if (!info) {
+                        return;
+                    }
+                    hud.textContent =
+                        `帧 ${current}/${count} · ${info.slots_per_frame} 槽/帧 · ` +
+                        `${((info.slots_per_frame * (info.block_bytes + 8)) / 1024).toFixed(0)} KB/帧 · ` +
+                        `${info.frame_w}x${info.frame_h} · m=${info.module_px}`;
+                }
+
+                function schedule() {
+                    clearInterval(timer);
+                    timer = setInterval(async () => {
+                        if (!playing) {
+                            return;
+                        }
+                        await present((current % count) + 1);
+                        preloadNext();
+                    }, dwell);
+                }
+
+                function start() {
+                    if (!count) {
+                        return;
+                    }
+                    playing = true;
+                    document.body.classList.add("playing");
+                    pauseBtn.disabled = false;
+                    startBtn.disabled = true;
+                    schedule();
+                    preloadNext();
+                }
+
+                function pause() {
+                    playing = false;
+                    clearInterval(timer);
+                    pauseBtn.textContent = "继续";
+                    hud.textContent = "已暂停";
+                }
+
+                function resume() {
+                    if (!count) {
+                        return;
+                    }
+                    playing = true;
+                    pauseBtn.textContent = "暂停";
+                    schedule();
+                }
+
+                function exitPlay() {
+                    pause();
+                    document.body.classList.remove("playing");
+                    startBtn.disabled = false;
+                    pauseBtn.disabled = true;
+                    pauseBtn.textContent = "暂停";
+                }
+
+                startBtn.addEventListener("click", () => {
+                    start();
+                });
+                pauseBtn.addEventListener("click", () => {
+                    if (playing) {
+                        pause();
+                    } else {
+                        resume();
+                    }
+                });
+                stepBtn.addEventListener("click", () => {
+                    present((current % count) + 1);
+                });
+
+                document.addEventListener("keydown", (event) => {
+                    if (event.key === "Escape" && document.body.classList.contains("playing")) {
+                        exitPlay();
+                        return;
+                    }
+                    if (event.code === "Space") {
+                        event.preventDefault();
+                        if (playing) {
+                            pause();
+                        } else {
+                            resume();
+                        }
+                    } else if (event.key === "ArrowRight") {
+                        event.preventDefault();
+                        present((current % count) + 1);
+                    } else if (event.key === "f" || event.key === "F") {
+                        if (!document.fullscreenElement) {
+                            document.documentElement.requestFullscreen?.().catch(() => {});
+                        } else {
+                            document.exitFullscreen?.().catch(() => {});
+                        }
+                    }
+                });
+
+                async function boot() {
+                    try {
+                        const response = await fetch("/api/info");
+                        if (!response.ok) {
+                            throw new Error(`HTTP ${response.status}`);
+                        }
+                        info = await response.json();
+                    } catch (error) {
+                        meta.innerHTML = `<span class="error">无法连接生成端：${error}</span>`;
                         return;
                     }
 
-                    // 准备就绪，等待用户点击开始播放
-                    qrGrid.classList.remove("empty");
-                    dataPreview.classList.remove("expanded");
-                    pageIndex = 0;
-                    focusSeq = null;
-                    pageSizeMode = normalizePageSizeMode(perPageSelect.value);
-                    relayout();
-                    probeQrGeometry(slots[0]);
-                    statusSpan.textContent = "▶️";
-                    statusText.textContent = "准备就绪";
-                    startPlayBtn.disabled = false;
+                    count = info.frame_count;
+                    dwell = info.dwell_ms || 300;
+                    stepBtn.disabled = false;
 
-                    // 支持 http://localhost:9090/?autoplay=1 打开即自动播放（kiosk 场景）
-                    if (new URLSearchParams(window.location.search).has("autoplay")) {
-                        startPlayClick();
-                    }
-                } catch (error) {
-                    showError("无法连接到服务器");
-                    console.error(error);
-                }
-            }
+                    meta.textContent =
+                        `源文件 ${info.source}\n` +
+                        `${info.file_len} 字节 · SHA-256 ${info.hash.slice(0, 16)}…\n` +
+                        `${info.frame_count} 帧 · ${info.slots_per_frame} 分片/帧 · ` +
+                        `k=${info.k} m=${info.m} · ${info.frame_w}x${info.frame_h} · 模块 ${info.module_px}px\n` +
+                        `每帧 ${((info.slots_per_frame * (info.block_bytes + 8)) / 1024).toFixed(1)} KB · 停留 ${dwell} ms`;
 
-            // 点击开始播放按钮
-            function startPlayClick() {
-                hasStarted = true;
-                pageIndex = 0;
-                focusSeq = null;
-                document.body.classList.add("playing");
-                updateDisplay();
-                // 播放模式会隐藏顶栏/控件，可用区域变大：重新算张数与尺寸
-                queueRelayout();
-                startPlay();
-            }
-
-            function nextPage() {
-                // 播放到最后一屏：循环播放则回到第一屏，否则自动暂停
-                if (pageIndex + 1 >= pageCount()) {
-                    if (document.getElementById("loop-play").checked) {
-                        pageIndex = 0;
-                        focusSeq = null;
-                        updateDisplay();
-                        return;
-                    }
-                    stopPlay();
-                    statusSpan.textContent = "✅";
-                    statusText.textContent = "播放完毕";
-                    return;
-                }
-                pageIndex += 1;
-                focusSeq = null;
-                updateDisplay();
-            }
-
-            function startPlay() {
-                clearInterval(interval);
-                interval = setInterval(nextPage, SLIDE_INTERVAL_MS);
-                isPlaying = true;
-                statusSpan.textContent = "▶";
-                statusText.textContent = "播放中";
-                statusText.className = "status-playing";
-                playPauseBtn.textContent = "暂停";
-            }
-
-            function stopPlay() {
-                clearInterval(interval);
-                interval = null;
-                isPlaying = false;
-                statusSpan.textContent = "⏸";
-                statusText.textContent = "已暂停";
-                statusText.className = "";
-                playPauseBtn.textContent = "播放";
-            }
-
-            function togglePlay() {
-                if (isPlaying) {
-                    stopPlay();
-                } else {
-                    startPlay();
-                }
-            }
-
-            function restart() {
-                pageIndex = 0;
-                focusSeq = null;
-                updateDisplay();
-                if (!isPlaying) {
-                    startPlay();
-                }
-            }
-
-            function exitPlayMode() {
-                stopPlay();
-                document.body.classList.remove("playing");
-                hasStarted = false;
-                pageIndex = 0;
-                focusSeq = null;
-                queueRelayout();
-                statusSpan.textContent = "▶️";
-                statusText.textContent = "准备就绪";
-            }
-
-            function toggleFullscreen() {
-                if (!document.fullscreenElement) {
-                    const request = document.documentElement.requestFullscreen;
-                    if (request) {
-                        document.documentElement.requestFullscreen().catch(() => {});
-                    }
-                } else if (document.exitFullscreen) {
-                    document.exitFullscreen().catch(() => {});
-                }
-            }
-
-            function jumpToQr() {
-                const input = document.getElementById("jump-input");
-                const target = parseInt(input.value, 10);
-
-                if (isNaN(target) || target < 1 || target > totalQr) {
-                    alert(`请输入有效的片段号 (1-${totalQr})`);
-                    return;
-                }
-
-                // 跳到包含该片段的屏，并高亮它
-                focusSeq = target;
-                pageIndex = Math.floor((target - 1) / perPage);
-                updateDisplay();
-
-                if (!isPlaying && hasStarted) {
-                    statusSpan.textContent = "⏸";
-                    statusText.textContent = `已跳转到第 ${target} 片段`;
-                } else if (isPlaying) {
-                    statusSpan.textContent = "▶";
-                    statusText.textContent = `播放中 (第 ${target} 片段)`;
-                }
-
-                input.value = ""; // 清空输入框
-            }
-
-            function handleJumpKeypress(event) {
-                if (event.key === "Enter") {
-                    jumpToQr();
-                }
-            }
-
-            // 切换每屏张数时保持当前屏首片段仍在屏上
-            perPageSelect.addEventListener("change", () => {
-                pageSizeMode = normalizePageSizeMode(perPageSelect.value);
-                // relayout() 内部会先按旧张数记锚点，再重算页码
-                relayout();
-            });
-
-            // 空格播放/暂停，左右方向键翻屏，Esc 退出播放模式
-            document.addEventListener("keydown", (event) => {
-                const tag = event.target.tagName;
-                if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") {
-                    return;
-                }
-                if (event.key === "Escape" && document.body.classList.contains("playing")) {
-                    exitPlayMode();
-                    return;
-                }
-                if (!hasStarted) {
-                    return;
-                }
-                if (event.code === "Space") {
-                    event.preventDefault();
-                    togglePlay();
-                } else if (event.key === "ArrowRight") {
-                    event.preventDefault();
-                    stopPlay();
-                    nextPage();
-                } else if (event.key === "ArrowLeft") {
-                    event.preventDefault();
-                    stopPlay();
-                    if (pageIndex > 0) {
-                        pageIndex -= 1;
-                        focusSeq = null;
-                        updateDisplay();
+                    // 先渲染第一帧，确认能出图再自动播放
+                    await present(1);
+                    if (!params.has("manual")) {
+                        start();
                     }
                 }
-            });
 
-            function showError(message) {
-                statusSpan.textContent = "❌";
-                statusText.textContent = "错误";
-                statusText.className = "";
-                qrGrid.classList.add("empty");
-                dataPreview.classList.add("expanded");
-                dataPreview.innerHTML = `<div class="error">${message}</div>`;
-                progressBar.style.width = "0%";
-            }
-
-            // 页面加载时获取信息
-            loadQrInfo();
+                boot();
+            })();
         </script>
     </body>
 </html>
