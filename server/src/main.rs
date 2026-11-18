@@ -528,7 +528,9 @@ fn main_with_error(args: &[String]) -> Result<()> {
                         log(
                             "警告",
                             format!(
-                                "识别失败（累计 {} 次）: {}。确认播放页面在窗口内、未被最小化/缩放；必要时用 --rect x,y,w,h 指定码框",
+                                "识别失败（累计 {} 次）: {}。确认播放页面在窗口内、未被最小化/缩放；\
+                                 画面里明明有码却一直失败，多半是码图大于页面可视区被裁了（浏览器工具栏/任务栏会吃掉可视区），\
+                                 按页面面板打印的“页面可视区 WxH”重新生成；必要时用 --rect x,y,w,h 指定码框",
                                 stats.detect_errors, error
                             ),
                         );
@@ -877,7 +879,8 @@ fn open_capture_source(opts: &Options, screens: Vec<Screen>) -> Result<CaptureSo
         log(
             "提示",
             format!(
-                "发送端请用 --frame {}x{}（与客户区一致）生成，才能 1:1 播放",
+                "窗口客户区 {}x{}（含浏览器标签栏/地址栏/任务栏）。码图必须 <= 播放页面可视区才能 1:1 放下，\
+                 页面面板会打印“页面可视区 WxH”，请用那个尺寸生成；否则码图被裁、这里会一直报“没有找到码框”",
                 target.frame.width, target.frame.height
             ),
         );
@@ -998,6 +1001,11 @@ fn parse_options(args: &[String]) -> Result<Options> {
             other if other.starts_with("--out=") => {
                 opts.out = Some(non_empty_str(&other["--out=".len()..], "--out")?.to_string());
             }
+            // `server help` 与 `server --help` 等价
+            "help" => {
+                println!("{}", usage_text());
+                std::process::exit(0);
+            }
             other if other.starts_with('-') => {
                 return Err(anyhow!("未知参数 '{}'", other));
             }
@@ -1071,32 +1079,67 @@ fn parse_rect(value: &str) -> Result<Rect> {
     })
 }
 
+/// 帮助文本（`server -h` / `server --help` / `server help`）
 fn usage_text() -> String {
     [
-        "ScreenCode 接收端（单张高密度网格码）",
+        "ScreenCode 接收端（单张高密度网格码 v1）",
         "",
         "用法:",
         "  server [选项]",
+        "  server -h | --help | help     显示本帮助",
+        "",
+        "它做什么:",
+        "  默认后台截取进程 HSR 的窗口客户区（PrintWindow，被遮挡也能截，不能最小化）→",
+        "  定位黑边框 → 读帧头 → 按模块坐标采样 → 分片落盘（.qr_blocks.bin / .qr_state.json）→",
+        "  每组凑够 k 个分片就纠删恢复 → 全部收满后校验 SHA-256，写出 received_file_<时间戳>。",
+        "  画面在变但一直报「没有找到码框」，多半是码图比播放页可视区大被裁了：",
+        "  按播放页面板打印的「页面可视区 WxH」，用 client --frame 那个尺寸重新生成。",
         "",
         "选项:",
-        "  --resume                继续上次的分片库",
-        "  --clean                 清除分片库后退出",
-        "  --process NAME          按进程名抓窗口（默认 HSR）",
-        "  --window TITLE          按窗口标题片段抓窗口",
-        "  --fullscreen            抓整块屏幕",
-        "  --interval-ms N         截屏间隔（默认 50）",
-        "  --recheck-ms N          画面不变时也重解的间隔（默认 100）",
-        "  --idle-timeout N        无新分片多少秒后停止（0 表示永不）",
-        "  --rect x,y,w,h          手工指定码框（自动定位失败时用）",
-        "  --out NAME              输出文件名",
-        "  --list-windows          列出所有可见窗口后退出",
-        "  -v, --verbose           控制台也输出每帧细节",
-        "  -h, --help              显示帮助",
+        "  会话:",
+        "    --resume               继续上次的分片库（中断/超时后用）",
+        "    --clean                清空分片库后退出",
+        "  窗口:",
+        "    --process NAME         按进程名匹配窗口（默认 HSR，部分匹配即可命中 HSRClient）",
+        "    --window TITLE         按窗口标题片段匹配（与 --process 可叠加）",
+        "    --fullscreen           抓整块屏幕（播放页不在窗口里时用）",
+        "    --rect x,y,w,h         手工指定码框（含黑边框，自动定位失败时用）",
+        "    --list-windows         列出所有可见窗口及其客户区尺寸后退出",
+        "  时序:",
+        "    --interval-ms N        截屏间隔（默认 50；机器慢可放大）",
+        "    --recheck-ms N         画面不变时也重新识别的间隔（默认 100）",
+        "  输出:",
+        "    --out NAME             输出文件名（默认 received_file_<时间戳>）",
+        "    --idle-timeout N       无新分片多少秒后停止（默认 3，0 表示永不停止）",
+        "  诊断:",
+        "    -v, --verbose          控制台也打印每帧细节（默认细节只写 logs/）",
+        "    -h, --help             显示本帮助",
         "",
         "示例:",
+        "  # 1) 最常用：抓 HSR 窗口，收满后自动纠删恢复 + 校验 SHA-256",
         "  server",
+        "",
+        "  # 2) 上次没收到 k 个分片就停了：接着收（分片库会保留）",
         "  server --resume",
-        "  server --fullscreen --rect 8,8,2488,1312",
+        "",
+        "  # 3) 不知道抓哪个窗口：先列一遍，再按进程或标题抓",
+        "  server --list-windows",
+        "  server --window Chrome",
+        "",
+        "  # 4) 播放页不在普通窗口里（比如全屏/直接贴屏幕）：抓整屏",
+        "  server --fullscreen",
+        "",
+        "  # 5) 自动定位失败：手工给码框，并让控制台输出每帧细节",
+        "  server -v --window Chrome --rect 8,111,1884,804",
+        "",
+        "  # 6) 机器慢 / 大窗口识别吃力：放宽间隔，少做重复识别",
+        "  server --interval-ms 80 --recheck-ms 200",
+        "",
+        "  # 7) 个别分片一直补不上：不要因为空闲 3 秒就退出，一直等下去",
+        "  server --idle-timeout 0",
+        "",
+        "  # 8) 换文件重来：先清库",
+        "  server --clean",
     ]
     .join("\n")
 }
@@ -1164,5 +1207,21 @@ mod tests {
     fn civil_dates_are_sane() {
         let (y, m, d) = civil_from_days(0);
         assert_eq!((y, m, d), (1970, 1, 1));
+    }
+
+    #[test]
+    fn usage_has_options_and_examples() {
+        let text = usage_text();
+        for needle in [
+            "用法:",
+            "选项:",
+            "示例:",
+            "--resume",
+            "--rect",
+            "--list-windows",
+            "页面可视区",
+        ] {
+            assert!(text.contains(needle), "帮助文本缺少「{}」", needle);
+        }
     }
 }

@@ -10,6 +10,7 @@ target
 
 # 本地基准/调试脚本与临时目录
 .bench/
+.diag/
 tmp-e2e/
 tmp-qr/
 

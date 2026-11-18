@@ -186,7 +186,13 @@ async fn main() {
 async fn run() -> Result<()> {
     let args = parse_args(&env::args().collect::<Vec<_>>());
 
-    if args.help {
+    // `client help` 与 `client --help` 等价
+    let wants_help = args.help
+        || args
+            .file
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("help"));
+    if wants_help {
         print_usage();
         return Ok(());
     }
@@ -289,8 +295,12 @@ fn resolve_frame(args: &Args) -> Result<(u32, u32)> {
             return Ok(frame);
         }
         println!(
-            "警告: 没有找到进程 {} 的窗口，回退到 {}x{}；可用 --frame WxH 指定",
+            "警告: 没有找到进程 {} 的窗口，回退到 {}x{}",
             args.process, DEFAULT_FRAME.0, DEFAULT_FRAME.1
+        );
+        println!(
+            "      --frame 必须 <= 播放页面的可视区（页面面板里会打印“页面可视区 WxH”），\
+             否则码图会被浏览器/任务栏裁掉，接收端找不到完整码框"
         );
         return Ok(DEFAULT_FRAME);
     }
@@ -430,11 +440,16 @@ fn parse_args(raw: &[String]) -> Args {
             "--auto" | "--frame=auto" => args.auto_frame = true,
             "--frame" => {
                 let value = iter.next().map(|v| v.as_str()).unwrap_or("");
-                match parse_frame(value) {
-                    Some(frame) => args.frame = Some(frame),
-                    None => {
-                        eprintln!("--frame 需要 WxH，例如 2505x1329；收到 '{}'", value);
-                        std::process::exit(2);
+                if value.eq_ignore_ascii_case("auto") {
+                    // 与 --frame=auto 等价（README 里写的就是这种空格形式）
+                    args.auto_frame = true;
+                } else {
+                    match parse_frame(value) {
+                        Some(frame) => args.frame = Some(frame),
+                        None => {
+                            eprintln!("--frame 需要 WxH，例如 2505x1329；收到 '{}'", value);
+                            std::process::exit(2);
+                        }
                     }
                 }
             }
@@ -503,7 +518,10 @@ fn parse_args(raw: &[String]) -> Args {
                 args.process = other["--process=".len()..].to_string();
             }
             other if other.starts_with('-') => {
-                eprintln!("未知参数 '{}'", other);
+                eprintln!(
+                    "未知参数 '{}'；用 client --help 查看完整用法和示例",
+                    other
+                );
                 std::process::exit(2);
             }
             other => {
@@ -589,29 +607,63 @@ fn probe_window(_process: &str) -> Result<()> {
     Err(anyhow!("窗口探测只支持 Windows；请用 --frame WxH 手动指定"))
 }
 
+/// 帮助文本（`client -h` / `client --help` / `client help`）
+fn usage_text() -> String {
+    [
+        "ScreenCode 发送端（单张高密度网格码 v1）",
+        "",
+        "用法:",
+        "  client <文件> [选项]            生成码图并起 HTTP 播放服务（默认端口 9090）",
+        "  client <文件> --export DIR      只导出 frame_*.png 到 DIR 后退出",
+        "  client --probe                  打印目标窗口客户区尺寸（决定 --frame）",
+        "  client -h | --help | help       显示本帮助",
+        "",
+        "先读这段:",
+        "  码图是 frame_w × frame_h 的 1-bit PNG，播放页按设备像素 1:1 摆放，",
+        "  所以 --frame 必须 <= 播放页面的「可视区」（页面面板会打印，例如 页面可视区 1912x857）。",
+        "  比可视区大 → 右侧/底部被裁 → 黑边框不闭合 → 接收端一直报「没有找到码框」。",
+        "  可视区 = 窗口去掉浏览器标签栏/地址栏、再减去任务栏；F11 全屏 + 任务栏自动隐藏最大。",
+        "",
+        "选项:",
+        "  版式:",
+        "    --frame WxH            目标帧尺寸（默认 1920x1080）",
+        "    --frame auto           读 --process 窗口的客户区尺寸（窗口被缩放后会变）",
+        "    --module-px N          每模块像素（默认 2；1 更密但要求严格 1:1；3 更稳）",
+        "    --block-bytes N        分片净荷字节（默认 4096）",
+        "    --parity F             纠删码冗余比例（默认 0.10，0 表示关闭）",
+        "  播放:",
+        "    --dwell-ms N           每帧停留毫秒（默认 300）",
+        "    --port N               HTTP 端口（默认 9090）",
+        "  窗口:",
+        "    --process NAME         --frame auto / --probe 匹配的进程（默认 HSR）",
+        "  导出:",
+        "    --export DIR           只导出 PNG 帧到 DIR，不起服务",
+        "  其它:",
+        "    -h, --help             显示本帮助",
+        "",
+        "示例:",
+        "  # 1) 最常用：按页面可视区生成并播放（尺寸抄页面面板里的「页面可视区 WxH」）",
+        "  client .\\big.zip --frame 1912x856",
+        "",
+        "  # 2) 先探窗口，再让发送端自动取窗口客户区尺寸",
+        "  client --probe",
+        "  client .\\big.zip --frame auto",
+        "",
+        "  # 3) 更密：约 4 倍容量，但要求严格 1:1（必须是设备像素 1:1、不能有任何缩放）",
+        "  client .\\big.zip --frame 1900x820 --module-px 1",
+        "",
+        "  # 4) 遮挡/反光多：把冗余提到 20%（收满仍自动纠删，只是帧数变多）",
+        "  client .\\big.zip --frame 1912x856 --parity 0.2",
+        "",
+        "  # 5) 离线导出 + 自检整条链路（不依赖窗口和播放页）",
+        "  client .\\big.zip --export qr_output --frame 1900x820",
+        "  cargo run -p screencode --example verify_frames -- qr_output",
+    ]
+    .join("\n")
+}
+
 fn print_usage() {
-    println!("ScreenCode 发送端（单张高密度网格码）");
-    println!();
-    println!("用法:");
-    println!("  client <文件路径> [选项]      生成并起 HTTP 播放服务");
-    println!("  client <文件路径> --export DIR  只导出 PNG 帧");
-    println!("  client --probe [--process HSR] 打印游戏窗口客户区尺寸");
-    println!();
-    println!("选项:");
-    println!("  --frame WxH          目标帧尺寸（默认 1920x1080；--frame auto 读窗口）");
-    println!("  --module-px N        每个模块的像素（默认 2；1 更密但要求严格 1:1）");
-    println!("  --block-bytes N      分片净荷字节（默认 4096）");
-    println!("  --parity F           纠删码冗余比例（默认 0.10，0 表示关闭）");
-    println!("  --dwell-ms N         每帧停留毫秒（默认 300）");
-    println!("  --port N             HTTP 端口（默认 9090）");
-    println!("  --process NAME       自动取窗口尺寸时匹配的进程（默认 HSR）");
-    println!("  --export DIR         导出 frame_*.png 到目录后退出");
-    println!("  -h, --help           显示帮助");
-    println!();
-    println!("示例:");
-    println!("  client ./big.zip");
-    println!("  client ./big.zip --frame auto --module-px 2");
-    println!("  client ./big.zip --export qr_output --frame 2505x1329");
+    println!("{}", usage_text());
 }
 
 #[cfg(test)]
@@ -643,5 +695,29 @@ mod tests {
         assert!(parsed.auto_frame);
         assert_eq!(parsed.module_px, 1);
         assert!((parsed.parity - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parses_auto_frame_in_space_form() {
+        // README 里写的是 `--frame auto`，空格形式也必须能认
+        let parsed = parse_args(&args(&["client", "a.bin", "--frame", "auto"]));
+        assert!(parsed.auto_frame);
+        assert_eq!(parsed.frame, None);
+    }
+
+    #[test]
+    fn usage_has_options_and_examples() {
+        let text = usage_text();
+        for needle in [
+            "用法:",
+            "选项:",
+            "示例:",
+            "--frame",
+            "--probe",
+            "--export",
+            "页面可视区",
+        ] {
+            assert!(text.contains(needle), "帮助文本缺少「{}」", needle);
+        }
     }
 }

@@ -88,6 +88,22 @@
                 color: #fca5a5;
             }
 
+            /* 码图放不下时的红框提示：播放状态下不会被看到，所以放不下就不自动播放 */
+            #panel .warn {
+                display: none;
+                margin-top: 10px;
+                padding: 8px 10px;
+                border-radius: 8px;
+                border: 1px solid rgba(248, 113, 113, 0.55);
+                background: rgba(127, 29, 29, 0.55);
+                color: #fecaca;
+                white-space: pre-wrap;
+            }
+
+            #panel .warn.show {
+                display: block;
+            }
+
             #panel .row {
                 display: flex;
                 gap: 8px;
@@ -133,6 +149,7 @@
         <div id="panel">
             <h1>ScreenCode 单图播放</h1>
             <div class="meta" id="meta">正在连接服务器…</div>
+            <div class="warn" id="warn"></div>
             <div class="row">
                 <button id="start">开始播放</button>
                 <button id="pause" class="ghost" disabled>暂停</button>
@@ -155,6 +172,7 @@
                     document.getElementById("layerB"),
                 ];
                 const meta = document.getElementById("meta");
+                const warnBox = document.getElementById("warn");
                 const startBtn = document.getElementById("start");
                 const pauseBtn = document.getElementById("pause");
                 const stepBtn = document.getElementById("step");
@@ -168,7 +186,6 @@
                 let timer = null;
                 let playing = false;
                 let busy = false;
-                let sizeWarned = false;
                 let failures = 0;
 
                 const dpr = window.devicePixelRatio || 1;
@@ -177,24 +194,56 @@
                     return `/api/frame/${n}`;
                 }
 
+                // 页面可视区（设备像素）：码图必须 <= 这个尺寸，否则右侧/底部被裁、黑边框不闭合
+                function viewportPx() {
+                    return {
+                        w: Math.round(window.innerWidth * dpr),
+                        h: Math.round(window.innerHeight * dpr),
+                    };
+                }
+
+                // 当前这一帧的像素尺寸（优先用真正加载过的图）
+                function codeSize() {
+                    for (const layer of layers) {
+                        if (layer.naturalWidth > 0) {
+                            return { w: layer.naturalWidth, h: layer.naturalHeight };
+                        }
+                    }
+                    if (info && info.frame_w) {
+                        return { w: info.frame_w, h: info.frame_h };
+                    }
+                    return null;
+                }
+
+                // 放得下返回 null；放不下返回提示文案，并把红字显示出来
+                function fitProblem() {
+                    const code = codeSize();
+                    if (!code) {
+                        return null;
+                    }
+                    const vp = viewportPx();
+                    if (code.w <= vp.w && code.h <= vp.h) {
+                        warnBox.textContent = "";
+                        warnBox.classList.remove("show");
+                        return null;
+                    }
+                    const text =
+                        `码图 ${code.w}x${code.h} 超出页面可视区 ${vp.w}x${vp.h}（设备像素）：` +
+                        `右侧/底部会被裁掉，接收端读不到完整黑边框。\n` +
+                        `请重新生成：client <文件> --frame ${vp.w}x${vp.h}\n` +
+                        `（可视区 = 浏览器窗口去掉标签栏/地址栏/任务栏后的部分；按 F11 全屏后再看这里的数字最大）`;
+                    warnBox.textContent = text;
+                    warnBox.classList.add("show");
+                    return text;
+                }
+
                 function resizeLayer(img) {
                     if (!img.naturalWidth || !img.naturalHeight) {
                         return;
                     }
                     // PNG 是设备像素；CSS 用 px / dpr 才能 1:1
-                    const w = img.naturalWidth / dpr;
-                    const h = img.naturalHeight / dpr;
-                    img.style.width = `${w}px`;
-                    img.style.height = `${h}px`;
-
-                    if (!sizeWarned && (w > window.innerWidth + 0.5 || h > window.innerHeight + 0.5)) {
-                        sizeWarned = true;
-                        console.warn(
-                            `图片 ${img.naturalWidth}x${img.naturalHeight} 大于视口 ` +
-                                `${Math.round(window.innerWidth * dpr)}x${Math.round(window.innerHeight * dpr)}，` +
-                                `右侧/底部会被裁掉；请用 client --probe 取尺寸后重新生成`
-                        );
-                    }
+                    img.style.width = `${img.naturalWidth / dpr}px`;
+                    img.style.height = `${img.naturalHeight / dpr}px`;
                 }
 
                 // 把第 n 帧加载进指定 layer（同一个 layer 已经加载过同一帧就跳过，避免重复请求/onload 不触发）
@@ -271,7 +320,8 @@
                 }
 
                 function start() {
-                    if (!count) {
+                    if (!count || fitProblem()) {
+                        // 被裁的码图播放没有意义，先把可视区尺寸提示出来
                         return;
                     }
                     playing = true;
@@ -344,6 +394,18 @@
                     }
                 });
 
+                // 窗口尺寸一变（HSR 窗口/浏览器被缩放），码图可能从「放得下」变成「被裁」
+                window.addEventListener("resize", () => {
+                    if (fitProblem()) {
+                        if (playing) {
+                            exitPlay();
+                        }
+                        startBtn.disabled = true;
+                    } else if (!playing) {
+                        startBtn.disabled = false;
+                    }
+                });
+
                 async function boot() {
                     try {
                         const response = await fetch("/api/info");
@@ -365,11 +427,14 @@
                         `${info.file_len} 字节 · SHA-256 ${info.hash.slice(0, 16)}…\n` +
                         `${info.frame_count} 帧 · ${info.slots_per_frame} 分片/帧 · ` +
                         `k=${info.k} m=${info.m} · ${info.frame_w}x${info.frame_h} · 模块 ${info.module_px}px\n` +
-                        `每帧 ${((info.slots_per_frame * (info.block_bytes + 8)) / 1024).toFixed(1)} KB · 停留 ${dwell} ms`;
+                        `每帧 ${((info.slots_per_frame * (info.block_bytes + 8)) / 1024).toFixed(1)} KB · 停留 ${dwell} ms\n` +
+                        `页面可视区 ${viewportPx().w}x${viewportPx().h}（设备像素，dpr ${dpr}）`;
 
-                    // 先渲染第一帧，确认能出图再自动播放
+                    // 先渲染第一帧，确认能出图；码图放不下就不自动播放（放了也读不出来）
                     await present(1);
-                    if (!params.has("manual")) {
+                    if (fitProblem()) {
+                        startBtn.disabled = true;
+                    } else if (!params.has("manual")) {
                         start();
                     }
                 }
