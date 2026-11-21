@@ -1,0 +1,3 @@
+# 帮助文案 golden 必须保持 LF：cli_test.go 按字节与 Rust 版输出比对。
+# 仓库默认 core.autocrlf=true，不加这条规则检出后会变 CRLF。
+client-go/testdata/** -text

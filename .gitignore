@@ -22,3 +22,6 @@ server/received_file_*
 qr_output/
 logs/
 server/logs/
+
+# Go 版发送端的构建产物
+client-go/*.exe

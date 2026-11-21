@@ -74,6 +74,21 @@ client <文件路径> --export qr_output --frame 2505x1329
 - 页面把图片按 `naturalWidth / devicePixelRatio` 放进 CSS 像素，保证 1 个图像像素 = 1 个屏幕像素。
 - 想看状态可用 `?debug=1`（右下角显示帧号，但**不要**在正式传输时用）。
 
+## Go 版发送端（client-go）
+
+`client-go/` 是用 Go 复刻的发送端，码制与 Rust 版逐个字节一致（同参数导出逐帧像素相同），
+专门用于在 **Windows 7** 上运行：Go 1.21 起要求 Windows 10+，所以客户端要用 Go **1.20.x** 构建。
+
+```bash
+cd client-go
+go vet ./... && go test ./...     # 门禁（不需要 Rust 工具链）
+build-win7.bat                    # 用 Go 1.20.x 构建 client-go.exe
+```
+
+用法与 Rust 版完全一致（`--frame` / `--module-px` / `--parity` / `--port` / `--export` / `--probe` 等），
+`client-go.exe --help` 即为完整说明。已知差异：PNG 压缩后体积不同（解码后像素一致，接收端不受影响）、
+二进制名为 `client-go.exe`。细节与对拍方法见 `client-go/README.md`。
+
 ## 接收端
 
 ```bash

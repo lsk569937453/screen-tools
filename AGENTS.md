@@ -13,6 +13,7 @@
   - 发送：`client/src/main.rs` → `screencode::{fec,layout,header,shard,render}` → `axum`（`/api/info`、`/api/frame/:n` + 内嵌页面）。
   - 接收：`server/src/main.rs`（`Session`）→ `screencode::detect::decode_frame` → `server/src/store.rs`（`ShardStore`）→ `finish`（RS 恢复 + SHA-256）→ 写 `received_file_<时间戳>`。
 - 平台边界：`screencode::win` 与窗口截图路径只在 `cfg(windows)` 下编译；其它平台只能 `server --fullscreen`。改这两处必须保证非 Windows 仍能 `cargo check`。
+- `client-go/`：发送端的 Go 复刻版（独立 Go module，`module screentools/client-go`），码制与 Rust 版逐字节一致，专门用于 Windows 7（必须用 Go **1.20.x** 构建，1.21+ 要求 Win10+）。改码制时必须同步改 `client-go/screencode/`，并跑跨实现对拍。
 - 动手前先读 `README.md`（用法/容量/排查）和 `docs/screencode-v1.md`（字节布局）。
 
 ## 2. 质量门禁
@@ -26,6 +27,7 @@ cargo test
 ```
 
 - clippy **零 warning**：`-D warnings` 已写进门禁，修 warning 属于改动范围内的工作，不接受"只是警告"。
+- Go 版发送端的门禁（在 `client-go/` 下）：`go vet ./...`、`go test ./...`；改了 `client-go/screencode/` 或渲染逻辑还要跑 `SCREENCODE_INTEROP=1 go test -run TestInteropWithRust -v .`。
 - 测试布局：单元测试内联 `#[cfg(test)]`；集成测试放所在 crate 的 `tests/`（目前 `screencode/tests/`、`common/tests/`）；不新建测试 crate。
 - 改动码制、渲染或识别时，额外跑离线 e2e（不依赖游戏窗口）：
 

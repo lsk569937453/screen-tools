@@ -1,0 +1,143 @@
+// 本文件由 gen-help.js 从 Rust client 的 clap 输出生成，请勿手工编辑。
+// 帮助文本必须与 Rust 侧逐字节一致，改文案时请重新抓取 client.exe 的输出。
+
+package main
+
+const helpLongText = `ScreenCode 发送端：把文件编码成单张高密度网格码（ScreenCode v1），逐帧显示给同机接收端抓屏识别。
+
+先读这段：
+  码图是 frame_w × frame_h 的 1-bit PNG，播放页按设备像素 1:1 摆放，
+  所以 --frame 必须 <= 播放页面的「可视区」（页面面板会打印，例如 页面可视区 1912x857）。
+  比可视区大 → 右侧/底部被裁 → 黑边框不闭合 → 接收端一直报「没有找到码框」。
+  可视区 = 窗口去掉浏览器标签栏/地址栏、再减去任务栏；F11 全屏 + 任务栏自动隐藏最大。
+
+Usage: %s [OPTIONS] [FILE]
+
+Arguments:
+  [FILE]
+          要发送的文件；传 help 显示帮助
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+版式:
+      --frame <WxH|auto>
+          目标帧尺寸：WxH 或 auto（auto = 读 --process 窗口客户区）
+          
+          [default: 1920x1080]
+
+      --module-px <N>
+          每个模块的像素（1 更密，3 更稳）
+          
+          [default: 2]
+
+      --block-bytes <N>
+          分片净荷字节
+          
+          [default: 4096]
+
+      --parity <F>
+          纠删码冗余比例（0 表示关闭，不推荐）
+          
+          [default: 0.1]
+
+播放:
+      --dwell-ms <N>
+          每帧停留毫秒
+          
+          [default: 300]
+
+      --port <N>
+          HTTP 端口
+          
+          [default: 9090]
+
+窗口:
+      --process <NAME>
+          --frame auto / --probe 匹配的进程名
+          
+          [default: HSR]
+
+      --probe
+          打印目标窗口客户区尺寸后退出
+
+导出:
+      --export [<DIR>]
+          只导出 PNG 帧到 DIR，不起服务；省略 DIR 时用 qr_output
+
+其它:
+  -v, --verbose
+          控制台也输出每帧细节
+
+示例:
+  # 1) 最常用：按页面可视区生成并播放（尺寸抄页面面板里的「页面可视区 WxH」）
+  client .\big.zip --frame 1912x856
+
+  # 2) 先探窗口，再让发送端自动取窗口客户区尺寸
+  client --probe
+  client .\big.zip --frame auto
+
+  # 3) 更密：约 4 倍容量，但要求严格 1:1（必须是设备像素 1:1、不能有任何缩放）
+  client .\big.zip --frame 1900x820 --module-px 1
+
+  # 4) 遮挡/反光多：把冗余提到 20%（收满仍自动纠删，只是帧数变多）
+  client .\big.zip --frame 1912x856 --parity 0.2
+
+  # 5) 离线导出 + 自检整条链路（不依赖窗口和播放页）
+  client .\big.zip --export qr_output --frame 1900x820
+  cargo run -p screencode --example verify_frames -- qr_output
+`
+
+const helpShortText = `ScreenCode 发送端：把文件编码成单张高密度码并起 HTTP 播放服务
+
+Usage: %s [OPTIONS] [FILE]
+
+Arguments:
+  [FILE]  要发送的文件；传 help 显示帮助
+
+Options:
+  -h, --help     Print help (see more with '--help')
+  -V, --version  Print version
+
+版式:
+      --frame <WxH|auto>  目标帧尺寸：WxH 或 auto（auto = 读 --process 窗口客户区） [default: 1920x1080]
+      --module-px <N>     每个模块的像素（1 更密，3 更稳） [default: 2]
+      --block-bytes <N>   分片净荷字节 [default: 4096]
+      --parity <F>        纠删码冗余比例（0 表示关闭，不推荐） [default: 0.1]
+
+播放:
+      --dwell-ms <N>  每帧停留毫秒 [default: 300]
+      --port <N>      HTTP 端口 [default: 9090]
+
+窗口:
+      --process <NAME>  --frame auto / --probe 匹配的进程名 [default: HSR]
+      --probe           打印目标窗口客户区尺寸后退出
+
+导出:
+      --export [<DIR>]  只导出 PNG 帧到 DIR，不起服务；省略 DIR 时用 qr_output
+
+其它:
+  -v, --verbose  控制台也输出每帧细节
+
+示例:
+  # 1) 最常用：按页面可视区生成并播放（尺寸抄页面面板里的「页面可视区 WxH」）
+  client .\big.zip --frame 1912x856
+
+  # 2) 先探窗口，再让发送端自动取窗口客户区尺寸
+  client --probe
+  client .\big.zip --frame auto
+
+  # 3) 更密：约 4 倍容量，但要求严格 1:1（必须是设备像素 1:1、不能有任何缩放）
+  client .\big.zip --frame 1900x820 --module-px 1
+
+  # 4) 遮挡/反光多：把冗余提到 20%（收满仍自动纠删，只是帧数变多）
+  client .\big.zip --frame 1912x856 --parity 0.2
+
+  # 5) 离线导出 + 自检整条链路（不依赖窗口和播放页）
+  client .\big.zip --export qr_output --frame 1900x820
+  cargo run -p screencode --example verify_frames -- qr_output
+`

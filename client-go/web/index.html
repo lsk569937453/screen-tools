@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>ScreenCode 播放</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+
+            html,
+            body {
+                width: 100%;
+                height: 100%;
+                overflow: hidden;
+                background: #ffffff;
+            }
+
+            body {
+                font-family: "Consolas", "Monaco", monospace;
+                color: #111;
+            }
+
+            /* 播放区：整张图按设备像素 1:1 放在左上角 */
+            #stage {
+                position: fixed;
+                left: 0;
+                top: 0;
+                width: 100%;
+                height: 100%;
+                background: #ffffff;
+            }
+
+            .layer {
+                position: absolute;
+                left: 0;
+                top: 0;
+                display: block;
+                image-rendering: pixelated;
+                image-rendering: crisp-edges;
+                background: #ffffff;
+                visibility: hidden;
+            }
+
+            body.playing {
+                cursor: none;
+            }
+
+            body.playing .layer {
+                cursor: none;
+            }
+
+            /* 面板只在播放前显示，播放时彻底隐藏，绝不压在码上 */
+            body.playing #panel {
+                display: none;
+            }
+
+            #panel {
+                position: fixed;
+                left: 16px;
+                top: 16px;
+                right: 16px;
+                max-width: 560px;
+                padding: 16px 18px;
+                border-radius: 10px;
+                background: rgba(17, 24, 39, 0.92);
+                color: #f9fafb;
+                font-size: 13px;
+                line-height: 1.6;
+                box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+            }
+
+            #panel h1 {
+                font-size: 16px;
+                margin-bottom: 6px;
+                letter-spacing: 0.5px;
+            }
+
+            #panel .meta {
+                color: #9ca3af;
+                white-space: pre-wrap;
+            }
+
+            #panel .error {
+                color: #fca5a5;
+            }
+
+            /* 码图放不下时的红框提示：播放状态下不会被看到，所以放不下就不自动播放 */
+            #panel .warn {
+                display: none;
+                margin-top: 10px;
+                padding: 8px 10px;
+                border-radius: 8px;
+                border: 1px solid rgba(248, 113, 113, 0.55);
+                background: rgba(127, 29, 29, 0.55);
+                color: #fecaca;
+                white-space: pre-wrap;
+            }
+
+            #panel .warn.show {
+                display: block;
+            }
+
+            #panel .row {
+                display: flex;
+                gap: 8px;
+                align-items: center;
+                margin-top: 10px;
+                flex-wrap: wrap;
+            }
+
+            button {
+                font: inherit;
+                padding: 7px 14px;
+                border: 0;
+                border-radius: 6px;
+                cursor: pointer;
+                background: #2563eb;
+                color: #fff;
+            }
+
+            button.ghost {
+                background: #374151;
+            }
+
+            #hud {
+                position: fixed;
+                right: 12px;
+                bottom: 10px;
+                font-size: 12px;
+                color: #9ca3af;
+                display: none;
+            }
+
+            body.debug #hud {
+                display: block;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="stage">
+            <img id="layerA" class="layer" alt="ScreenCode" />
+            <img id="layerB" class="layer" alt="ScreenCode" />
+        </div>
+
+        <div id="panel">
+            <h1>ScreenCode 单图播放</h1>
+            <div class="meta" id="meta">正在连接服务器…</div>
+            <div class="warn" id="warn"></div>
+            <div class="row">
+                <button id="start">开始播放</button>
+                <button id="pause" class="ghost" disabled>暂停</button>
+                <button id="step" class="ghost" disabled>下一帧</button>
+            </div>
+        </div>
+
+        <div id="hud"></div>
+
+        <script>
+            (() => {
+                const params = new URLSearchParams(location.search);
+                const debug = params.has("debug");
+                if (debug) {
+                    document.body.classList.add("debug");
+                }
+
+                const layers = [
+                    document.getElementById("layerA"),
+                    document.getElementById("layerB"),
+                ];
+                const meta = document.getElementById("meta");
+                const warnBox = document.getElementById("warn");
+                const startBtn = document.getElementById("start");
+                const pauseBtn = document.getElementById("pause");
+                const stepBtn = document.getElementById("step");
+                const hud = document.getElementById("hud");
+
+                let info = null;
+                let count = 0;
+                let dwell = 300;
+                let current = 1; // 当前显示的帧号（1 基）
+                let front = 0; // 当前可见的 layer 下标
+                let timer = null;
+                let playing = false;
+                let busy = false;
+                let failures = 0;
+
+                const dpr = window.devicePixelRatio || 1;
+
+                function frameUrl(n) {
+                    return `/api/frame/${n}`;
+                }
+
+                // 页面可视区（设备像素）：码图必须 <= 这个尺寸，否则右侧/底部被裁、黑边框不闭合
+                function viewportPx() {
+                    return {
+                        w: Math.round(window.innerWidth * dpr),
+                        h: Math.round(window.innerHeight * dpr),
+                    };
+                }
+
+                // 当前这一帧的像素尺寸（优先用真正加载过的图）
+                function codeSize() {
+                    for (const layer of layers) {
+                        if (layer.naturalWidth > 0) {
+                            return { w: layer.naturalWidth, h: layer.naturalHeight };
+                        }
+                    }
+                    if (info && info.frame_w) {
+                        return { w: info.frame_w, h: info.frame_h };
+                    }
+                    return null;
+                }
+
+                // 放得下返回 null；放不下返回提示文案，并把红字显示出来
+                function fitProblem() {
+                    const code = codeSize();
+                    if (!code) {
+                        return null;
+                    }
+                    const vp = viewportPx();
+                    if (code.w <= vp.w && code.h <= vp.h) {
+                        warnBox.textContent = "";
+                        warnBox.classList.remove("show");
+                        return null;
+                    }
+                    const text =
+                        `码图 ${code.w}x${code.h} 超出页面可视区 ${vp.w}x${vp.h}（设备像素）：` +
+                        `右侧/底部会被裁掉，接收端读不到完整黑边框。\n` +
+                        `请重新生成：client <文件> --frame ${vp.w}x${vp.h}\n` +
+                        `（可视区 = 浏览器窗口去掉标签栏/地址栏/任务栏后的部分；按 F11 全屏后再看这里的数字最大）`;
+                    warnBox.textContent = text;
+                    warnBox.classList.add("show");
+                    return text;
+                }
+
+                function resizeLayer(img) {
+                    if (!img.naturalWidth || !img.naturalHeight) {
+                        return;
+                    }
+                    // PNG 是设备像素；CSS 用 px / dpr 才能 1:1
+                    img.style.width = `${img.naturalWidth / dpr}px`;
+                    img.style.height = `${img.naturalHeight / dpr}px`;
+                }
+
+                // 把第 n 帧加载进指定 layer（同一个 layer 已经加载过同一帧就跳过，避免重复请求/onload 不触发）
+                async function loadInto(layer, n) {
+                    if (
+                        layer.dataset.frame === String(n) &&
+                        layer.complete &&
+                        layer.naturalWidth > 0
+                    ) {
+                        return;
+                    }
+                    await new Promise((resolve, reject) => {
+                        layer.onload = () => resolve();
+                        layer.onerror = () => reject(new Error(`第 ${n} 帧加载失败`));
+                        layer.dataset.frame = String(n);
+                        layer.src = frameUrl(n);
+                    });
+                }
+
+                async function present(n) {
+                    if (busy || !count) {
+                        return;
+                    }
+                    busy = true;
+                    try {
+                        const back = layers[1 - front];
+                        await loadInto(back, n);
+                        resizeLayer(back);
+                        const old = layers[front];
+                        back.style.visibility = "visible";
+                        old.style.visibility = "hidden";
+                        front = 1 - front;
+                        current = n;
+                        failures = 0;
+                        updateHud();
+                    } catch (error) {
+                        failures += 1;
+                        if (failures <= 3) {
+                            console.warn(error);
+                        }
+                    } finally {
+                        busy = false;
+                    }
+                }
+
+                // 预热下一帧：加载进当前隐藏的 layer，下一拍直接交换
+                function preloadNext() {
+                    if (!count) {
+                        return;
+                    }
+                    const next = (current % count) + 1;
+                    loadInto(layers[1 - front], next).catch(() => {});
+                }
+
+                function updateHud() {
+                    if (!info) {
+                        return;
+                    }
+                    hud.textContent =
+                        `帧 ${current}/${count} · ${info.slots_per_frame} 槽/帧 · ` +
+                        `${((info.slots_per_frame * (info.block_bytes + 8)) / 1024).toFixed(0)} KB/帧 · ` +
+                        `${info.frame_w}x${info.frame_h} · m=${info.module_px}`;
+                }
+
+                function schedule() {
+                    clearInterval(timer);
+                    timer = setInterval(async () => {
+                        if (!playing) {
+                            return;
+                        }
+                        await present((current % count) + 1);
+                        preloadNext();
+                    }, dwell);
+                }
+
+                function start() {
+                    if (!count || fitProblem()) {
+                        // 被裁的码图播放没有意义，先把可视区尺寸提示出来
+                        return;
+                    }
+                    playing = true;
+                    document.body.classList.add("playing");
+                    pauseBtn.disabled = false;
+                    startBtn.disabled = true;
+                    schedule();
+                    preloadNext();
+                }
+
+                function pause() {
+                    playing = false;
+                    clearInterval(timer);
+                    pauseBtn.textContent = "继续";
+                    hud.textContent = "已暂停";
+                }
+
+                function resume() {
+                    if (!count) {
+                        return;
+                    }
+                    playing = true;
+                    pauseBtn.textContent = "暂停";
+                    schedule();
+                }
+
+                function exitPlay() {
+                    pause();
+                    document.body.classList.remove("playing");
+                    startBtn.disabled = false;
+                    pauseBtn.disabled = true;
+                    pauseBtn.textContent = "暂停";
+                }
+
+                startBtn.addEventListener("click", () => {
+                    start();
+                });
+                pauseBtn.addEventListener("click", () => {
+                    if (playing) {
+                        pause();
+                    } else {
+                        resume();
+                    }
+                });
+                stepBtn.addEventListener("click", () => {
+                    present((current % count) + 1);
+                });
+
+                document.addEventListener("keydown", (event) => {
+                    if (event.key === "Escape" && document.body.classList.contains("playing")) {
+                        exitPlay();
+                        return;
+                    }
+                    if (event.code === "Space") {
+                        event.preventDefault();
+                        if (playing) {
+                            pause();
+                        } else {
+                            resume();
+                        }
+                    } else if (event.key === "ArrowRight") {
+                        event.preventDefault();
+                        present((current % count) + 1);
+                    } else if (event.key === "f" || event.key === "F") {
+                        if (!document.fullscreenElement) {
+                            document.documentElement.requestFullscreen?.().catch(() => {});
+                        } else {
+                            document.exitFullscreen?.().catch(() => {});
+                        }
+                    }
+                });
+
+                // 窗口尺寸一变（HSR 窗口/浏览器被缩放），码图可能从「放得下」变成「被裁」
+                window.addEventListener("resize", () => {
+                    if (fitProblem()) {
+                        if (playing) {
+                            exitPlay();
+                        }
+                        startBtn.disabled = true;
+                    } else if (!playing) {
+                        startBtn.disabled = false;
+                    }
+                });
+
+                async function boot() {
+                    try {
+                        const response = await fetch("/api/info");
+                        if (!response.ok) {
+                            throw new Error(`HTTP ${response.status}`);
+                        }
+                        info = await response.json();
+                    } catch (error) {
+                        meta.innerHTML = `<span class="error">无法连接生成端：${error}</span>`;
+                        return;
+                    }
+
+                    count = info.frame_count;
+                    dwell = info.dwell_ms || 300;
+                    stepBtn.disabled = false;
+
+                    meta.textContent =
+                        `源文件 ${info.source}\n` +
+                        `${info.file_len} 字节 · SHA-256 ${info.hash.slice(0, 16)}…\n` +
+                        `${info.frame_count} 帧 · ${info.slots_per_frame} 分片/帧 · ` +
+                        `k=${info.k} m=${info.m} · ${info.frame_w}x${info.frame_h} · 模块 ${info.module_px}px\n` +
+                        `每帧 ${((info.slots_per_frame * (info.block_bytes + 8)) / 1024).toFixed(1)} KB · 停留 ${dwell} ms\n` +
+                        `页面可视区 ${viewportPx().w}x${viewportPx().h}（设备像素，dpr ${dpr}）`;
+
+                    // 先渲染第一帧，确认能出图；码图放不下就不自动播放（放了也读不出来）
+                    await present(1);
+                    if (fitProblem()) {
+                        startBtn.disabled = true;
+                    } else if (!params.has("manual")) {
+                        start();
+                    }
+                }
+
+                boot();
+            })();
+        </script>
+    </body>
+</html>
